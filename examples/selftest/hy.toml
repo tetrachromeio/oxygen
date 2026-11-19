@@ -1,0 +1,5 @@
+[project]
+name = "selftest"
+
+[dependencies]
+Oxygen = { path = "../.." }

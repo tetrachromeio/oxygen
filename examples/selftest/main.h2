@@ -1,0 +1,120 @@
+// Oxygen's self-test: serves on a free port in a background thread, and the main
+// thread talks to it as a client over real sockets. Run by tests/run_tests.py.
+use Elemental
+use Elemental.Net
+use Elemental.System
+use Elemental.Thread
+use Elemental.Time
+use Oxygen
+
+new function handle(req: Request, res: Response) {
+    if req.get("/") { res.text("Hello, World!") }
+    else if req.get("/json") { res.json("{{\"message\":\"Hello, World!\"}}") }
+    else if req.get("/greet") {
+        match req.param_text("name") {
+            None => { res.send(400, "text/plain", "no name") }
+            Some(n) => { res.text("hello " + n) }
+        }
+    }
+    else if starts_with(req.path, "/files/") { res.text("file: " + req.decoded_path()) }
+    else if req.get("/agent") { res.text("agent=" + string(req.header("USER-AGENT"))) }
+    else if req.post("/echo") {
+        res.header("X-Length", "{req.body.len}")
+        res.send(201, "application/octet-stream", req.body)
+    }
+    else if req.get("/events") {
+        res.begin_events()
+        for i in 0..3 { res.event("tick {i}") }
+        res.end_events()
+    }
+    else if req.get("/silent") {} // no answer: Oxygen sends 500
+    else { res.not_found() }
+}
+
+new function run_server(port: int) -> int { return serve("127.0.0.1", port, 1, handle) }
+
+// Prints a reply without its Date line.
+new function show(reply: str) {
+    for line in split(reply, "\r\n") {
+        if !starts_with(line, "Date: ") { print(line) }
+    }
+}
+
+// Expect: 100-continue, as clients do it: headers, wait for "100 Continue", then the body.
+new function expect_exchange(port: int) {
+    print("== expect 100-continue")
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("connect failed: {e}") }
+        Ok(c) => {
+            c.write("POST /echo HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n")
+            var interim = string("")
+            c.read_some(interim, 100)
+            show(interim.view())
+            c.write("abcde")
+            var reply = string("")
+            c.read_all(reply)
+            show(reply.view())
+        }
+    }
+}
+
+// Sends raw bytes, prints the reply without its Date line.
+new function exchange(port: int, title: str, request: str) {
+    print("== {title}")
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("connect failed: {e}") }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            show(reply.view())
+        }
+    }
+}
+
+new function main() -> int {
+    var port = 0
+    match listen("127.0.0.1", 0) {
+        Err(e) => {
+            print("no free port: {e}")
+            return 1
+        }
+        Ok(l) => { port = l.port }
+    }
+    let server = spawn(port, run_server)
+    var up = false
+    for attempt in 0..200 {
+        match connect("127.0.0.1", port) {
+            Err(e) => { sleep(0.01) }
+            Ok(c) => {
+                up = true
+                break
+            }
+        }
+    }
+    if !up {
+        print("server didn't start")
+        exit_now(1)
+    }
+    exchange(port, "plain", "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    exchange(port, "json", "GET /json HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    exchange(port, "query", "GET /greet?x=1&name=oxygen HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "header (any case)", "GET /agent HTTP/1.1\r\nuser-agent: tester/1\r\nConnection: close\r\n\r\n")
+    exchange(port, "post body", "POST /echo HTTP/1.1\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world")
+    exchange(port, "pipelined", "GET / HTTP/1.1\r\n\r\nGET /json HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "http/1.0 closes", "GET / HTTP/1.0\r\n\r\n")
+    exchange(port, "not found", "GET /nope HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "no answer", "GET /silent HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "events", "GET /events HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "malformed", "nonsense\r\n\r\n")
+    exchange(port, "query, percent-decoded", "GET /greet?name=caf%C3%A9+au+lait HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "path, percent-decoded", "GET /files/my%20doc%2Fv2 HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "head", "HEAD /json HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "chunked body", "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: t\r\n\r\nGET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "bad chunk", "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n")
+    exchange(port, "unknown encoding", "POST /echo HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n")
+    expect_exchange(port)
+    exchange(port, "bad length", "POST /echo HTTP/1.1\r\nContent-Length: 12x\r\n\r\n")
+    exit_now(0)
+    return 0
+}

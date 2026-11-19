@@ -1,0 +1,36 @@
+// The benchmark server: the same endpoints as the Node, FastAPI and axum servers
+// in oxygen/bench.   hello [port] [threads]
+//   GET /        Hello, World! (text/plain)
+//   GET /json    {"message":"Hello, World!"}
+//   GET /bytes   16 KB
+//   POST /echo   the request body back
+use Elemental
+use Elemental.Json
+use Oxygen
+
+new function handle(req: Request, res: Response) {
+    if req.get("/") { res.text("Hello, World!") }
+    else if req.get("/json") {
+        // Built and serialized per request, as the other servers do (and as TechEmpower requires).
+        var w = JsonWriter()
+        w.begin_object()
+        w.key("message")
+        w.text("Hello, World!")
+        w.end_object()
+        res.json(w.out.view())
+    }
+    else if req.get("/bytes") { res.send(200, "application/octet-stream", ptr<string>(req.context)[0].view()) }
+    else if req.post("/echo") { res.send(200, "application/octet-stream", req.body) }
+    else { res.not_found() }
+}
+
+new function main() -> int {
+    let argv = args()
+    var port = 8080
+    var threads = 1
+    if argv.len() > 1 { port = unwrap_or(parse_int(argv[1]), port) }
+    if argv.len() > 2 { threads = unwrap_or(parse_int(argv[2]), threads) }
+    var big = string("")
+    for i in 0..16384 { big.append("x") }
+    return serve_with("127.0.0.1", port, threads, ptr<u8>(&big), handle)
+}
