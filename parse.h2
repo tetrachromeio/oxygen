@@ -291,3 +291,31 @@ new function reject(c: ptr<Conn>, status: int, date: ptr<u8>) -> bool {
     c[0].header_scan = 0
     return false
 }
+
+// Runs `handler` against `raw_request` entirely in memory, with no socket
+// involved — this is what Oxygen.Test's dispatch() builds on, kept here
+// (not duplicated in that separate submodule) so there's exactly one
+// parser, not two that could drift apart. Returns the raw response bytes
+// (status line, headers, body) exactly as answer() would write them to a
+// real connection's output buffer.
+//
+// Server-Sent Events (begin_events/event/end_events) won't work correctly
+// through this: those write directly to a socket, and there isn't one
+// here. Test a streaming handler the normal way, against
+// examples/selftest-style real sockets, not through this.
+pub new function dispatch_in_memory(handler: Handler, raw_request: str) -> string {
+    var c = Conn(true, buffer(DEFAULT_BUF_BYTES), buffer(DEFAULT_BUF_BYTES), 0, false, false, 0, 0)
+    put(ptr<Buffer>(&c.input), raw_request)
+    var headers: [Header; 64] = [Header("", "")]
+    var extra = buffer(256)
+    var date: [u8; 29] = [0]
+    let datep = ptr<u8>(&date[0])
+    http_date(datep)
+    answer(ptr<Conn>(&c), -1, handler, ptr<Header>(&headers[0]), ptr<Buffer>(&extra), datep, null)
+    var result = string("")
+    result.append(str(c.output.data, uint(c.output.len)))
+    free_bytes(c.input.data)
+    free_bytes(c.output.data)
+    free_bytes(extra.data)
+    return result
+}
