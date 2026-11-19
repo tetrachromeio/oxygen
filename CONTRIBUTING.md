@@ -5,6 +5,26 @@ contributions should be bug fixes, test cases, or docs; new features should
 have a clear use case and fit the "no allocation per request, no runtime
 underneath" design, not add either.
 
+## Layout
+
+One module (`use Oxygen`), split across files by concern — all `include`d
+from `init.h2`, which is otherwise just the module doc comment and `use`
+lines (see [spec/syntax.md](https://github.com/tetrachromeio/hydrogen/blob/main/spec/syntax.md#multi-file-modules-include)
+in the hydrogen repo for how `include` works):
+
+| File | What's in it |
+|---|---|
+| `limits.h2` | the tunable limits (`MAX_BODY_BYTES` and the rest) |
+| `buffer.h2` | the growable byte buffer requests and responses are built from |
+| `request.h2` | `Header`, `Request`, and the header/query parsing helpers |
+| `response.h2` | `Response`, including Server-Sent Events, and the `Handler` type |
+| `parse.h2` | the HTTP/1.1 parser: headers, chunked bodies, pipelining |
+| `loop.h2` | the event loop, and the public `serve()` / `serve_with()` |
+
+All of them share one namespace (a non-`pub` item in `parse.h2` is visible
+from `loop.h2`, say), so put something where a reader looking for it would
+look first, not necessarily where it's used.
+
 ## Setup
 
 You'll need the Hydrogen compiler. There's no release binary yet, so build

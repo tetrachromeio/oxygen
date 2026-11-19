@@ -1,0 +1,292 @@
+// A connection's state, kept in a table indexed by its fd.
+new type Conn {
+    open: bool
+    input: Buffer
+    output: Buffer
+    sent: int             // bytes of output already sent
+    closing: bool         // close once output is sent
+    continued: bool       // "100 Continue" already sent for the request being received
+    header_scan: int      // how far into input we've already scanned for \r\n\r\n with no luck
+}
+
+// Parses and answers every complete request in c's input. Returns false if the
+// connection must close (after its output is sent).
+new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header>, extra: ptr<Buffer>, date: ptr<u8>,
+                    context: ptr<u8>) -> bool {
+    var at = 0
+    var keep = true
+    let data = c[0].input.data
+    let n = c[0].input.len
+    while keep && at < n {
+        // Find the end of the header block. Resume from where a previous call
+        // already scanned with nothing found (header_scan), minus a few bytes in
+        // case a "\r\n\r\n" straddled that boundary, rather than rescanning from
+        // `at` every time: a header block drip-fed one byte per read would
+        // otherwise cost O(size^2), not O(size), to assemble.
+        var end = -1
+        var i = at
+        if c[0].header_scan > i {
+            i = c[0].header_scan
+            if i > at + 3 { i -= 3 } else { i = at }
+        }
+        while i + 3 < n {
+            if data[i] == u8('\r') && data[i + 1] == u8('\n') && data[i + 2] == u8('\r') && data[i + 3] == u8('\n') {
+                end = i
+                break
+            }
+            i += 1
+        }
+        if end < 0 {
+            c[0].header_scan = n
+            if n - at > MAX_HEADER_BYTES { return reject(c, 431, date) }
+            break
+        }
+        c[0].header_scan = 0
+        // Request line: METHOD SP TARGET SP HTTP/1.x
+        var p = at
+        while p < end && data[p] != u8(' ') { p += 1 }
+        let method = str(ptr<u8>(&data[at]), uint(p - at))
+        p += 1
+        let t0 = p
+        while p < end && data[p] != u8(' ') { p += 1 }
+        let target = str(ptr<u8>(&data[t0]), uint(p - t0))
+        p += 1
+        let v0 = p
+        while p < end && data[p] != u8('\r') { p += 1 }
+        // Reaching `end` without finding an earlier \r just means this line's
+        // own terminator is the one at `end` (already confirmed \r\n above) —
+        // normal for the last header/request line. Finding a \r before that is
+        // only valid if \n follows it; a bare \r (one that doesn't) would mean
+        // this scan stopped short of the real line ending, and blindly treating
+        // it as one would read the rest of this line as the start of the next,
+        // which a front-end proxy's own (stricter) parser wouldn't do the same way.
+        if p < end && data[p + 1] != u8('\n') { return reject(c, 400, date) }
+        let version = str(ptr<u8>(&data[v0]), uint(p - v0))
+        if method.len == 0 || target.len == 0 || (version != "HTTP/1.0" && version != "HTTP/1.1") {
+            return reject(c, 400, date)
+        }
+        let minor = int(version[7]) - int('0')
+        p += 2
+        // Headers.
+        var count = 0
+        var content_length = 0
+        var chunked = false
+        var has_content_length = false
+        var has_transfer_encoding = false
+        var close_asked = false
+        var keep_asked = false
+        var expect_continue = false
+        while p < end {
+            let l0 = p
+            while p < end && data[p] != u8('\r') { p += 1 }
+            // Same reasoning as the request line's version check above.
+            if p < end && data[p + 1] != u8('\n') { return reject(c, 400, date) }
+            let line = str(ptr<u8>(&data[l0]), uint(p - l0))
+            p += 2
+            var colon: uint = 0
+            while colon < line.len && line[colon] != u8(':') { colon += 1 }
+            if colon == line.len { return reject(c, 400, date) }
+            if count == MAX_HEADERS { return reject(c, 431, date) }
+            let name = slice(line, 0, colon)
+            // An empty name, or one with characters a header name can't have
+            // (spaces, control characters, ':' itself) risks a front-end proxy
+            // parsing the same header differently than we do.
+            if !valid_header_name(name) { return reject(c, 400, date) }
+            var v = colon + 1
+            while v < line.len && (line[v] == u8(' ') || line[v] == u8('\t')) { v += 1 }
+            var e = line.len
+            while e > v && (line[e - 1] == u8(' ') || line[e - 1] == u8('\t')) { e -= 1 }
+            let value = slice(line, v, e)
+            headers[count] = Header(name, value)
+            count += 1
+            if same_ignoring_case(name, "content-length") {
+                // A second Content-Length header (even with the same value) is
+                // exactly the kind of thing a front-end proxy and Oxygen could
+                // disagree about, so it's rejected outright rather than only
+                // keeping the last one.
+                if has_content_length { return reject(c, 400, date) }
+                has_content_length = true
+                if value.len == 0 { return reject(c, 400, date) }
+                // More than a handful of digits is already well past
+                // MAX_BODY_BYTES; rejecting here keeps the accumulator far
+                // from ever overflowing, rather than relying on the
+                // MAX_BODY_BYTES check below to catch it after every digit
+                // (which an overflow could land back under, unnoticed).
+                if value.len > 10 { return reject(c, 413, date) }
+                content_length = 0
+                for k in 0..value.len {
+                    let d = int(value[k]) - int('0')
+                    if d < 0 || d > 9 { return reject(c, 400, date) }
+                    content_length = content_length * 10 + d
+                    if content_length > MAX_BODY_BYTES { return reject(c, 413, date) }
+                }
+            } else if same_ignoring_case(name, "transfer-encoding") {
+                // Same reasoning as the duplicate Content-Length check above.
+                if has_transfer_encoding { return reject(c, 400, date) }
+                has_transfer_encoding = true
+                if same_ignoring_case(value, "chunked") { chunked = true }
+                else if !same_ignoring_case(value, "identity") { return reject(c, 501, date) }
+            } else if same_ignoring_case(name, "expect") {
+                if same_ignoring_case(value, "100-continue") { expect_continue = true }
+            } else if same_ignoring_case(name, "connection") {
+                if same_ignoring_case(value, "close") { close_asked = true }
+                if same_ignoring_case(value, "keep-alive") { keep_asked = true }
+            }
+        }
+        // A request framed as both chunked and sized is ambiguous: a front-end
+        // proxy that honors one of the two and we the other would disagree
+        // about where this request ends and the next one begins, letting a
+        // client smuggle a second, hidden request past the proxy. Reject it
+        // outright rather than picking one (RFC 9112 §6.1, §6.3).
+        if chunked && has_content_length { return reject(c, 400, date) }
+        let body_at = end + 4
+        var body_len = content_length
+        var next = body_at + content_length   // where the next request starts
+        if chunked {
+            var sizes = ChunkScan(0, 0)
+            let found = scan_chunks(data, body_at, n, ptr<ChunkScan>(&sizes))
+            if found == -2 { return reject(c, 400, date) }
+            if found == -3 { return reject(c, 413, date) }
+            if found == -1 {
+                if expect_continue && !c[0].continued { send_continue(c) }
+                break
+            }
+            body_len = join_chunks(data, body_at, sizes.end)
+            next = sizes.end
+        } else if body_at + content_length > n { // the body hasn't all arrived
+            if expect_continue && !c[0].continued { send_continue(c) }
+            break
+        }
+        c[0].continued = false
+        keep = !close_asked && (minor >= 1 || keep_asked)
+        // Path and query.
+        var q: uint = 0
+        while q < target.len && target[q] != u8('?') { q += 1 }
+        var query = ""
+        if q < target.len { query = slice(target, q + 1, target.len) }
+        let req = Request(method, target, slice(target, 0, q), query,
+                          str(ptr<u8>(&data[body_at]), uint(body_len)), minor, headers, count, context)
+        // `extra` is one buffer shared by every connection this worker thread
+        // serves; clear it before each response so nothing left over from an
+        // earlier request (this connection's or another's) can leak into this
+        // one's headers.
+        extra[0].len = 0
+        var state = ResponseState(ptr<Buffer>(&c[0].output), extra, fd, date, keep, false, false, false, method == "HEAD")
+        let res = Response(ptr<ResponseState>(&state))
+        handler(req, res)
+        if !state.sent { res.status(500) }
+        if state.streaming { res.end_events() }
+        if state.client_gone { return false }
+        keep = state.keep_alive
+        at = next
+        // Stop answering further pipelined requests once a lot of output is
+        // already queued and unsent: a client that pipelines many requests
+        // without reading its socket shouldn't make us buffer all of their
+        // responses in memory before the first flush attempt.
+        if c[0].output.len >= MAX_PENDING_OUTPUT_BYTES { break }
+    }
+    // Keep what's left (an incomplete request) at the start of the buffer.
+    if at > 0 {
+        let rest = n - at
+        for k in 0..rest { data[k] = data[at + k] }
+        c[0].input.len = rest
+        // header_scan (if set) was a position in the old indexing; shift it the
+        // same way the data just moved.
+        if c[0].header_scan > at { c[0].header_scan -= at } else { c[0].header_scan = 0 }
+    }
+    return keep
+}
+
+new function send_continue(c: ptr<Conn>) {
+    put(ptr<Buffer>(&c[0].output), "HTTP/1.1 100 Continue\r\n\r\n")
+    c[0].continued = true
+}
+
+new type ChunkScan {
+    total: int    // body bytes
+    end: int      // where the chunked body (with its trailer) ends
+}
+
+// Checks a chunked body starting at `at`, without changing it: -1 if it hasn't all
+// arrived, -2 if malformed, -3 if too large, else 0 with its size and end.
+new function scan_chunks(data: ptr<u8>, at: int, n: int, out: ptr<ChunkScan>) -> int {
+    var p = at
+    var total = 0
+    while true {
+        var size = 0
+        var digits = 0
+        while p < n {
+            let d = hex_digit(data[p])
+            if d < 0 { break }
+            size = size * 16 + d
+            digits += 1
+            if size > MAX_BODY_BYTES { return -3 }
+            p += 1
+        }
+        if p >= n { return -1 }
+        if digits == 0 { return -2 }
+        let ext0 = p
+        while p < n && data[p] != u8('\r') { // chunk extensions: ignored
+            if p - ext0 > MAX_CHUNK_EXT_BYTES { return -3 }
+            p += 1
+        }
+        if p + 1 >= n { return -1 }
+        if data[p + 1] != u8('\n') { return -2 }
+        p += 2
+        if size == 0 {
+            // Trailer fields (ignored), then an empty line.
+            while true {
+                let l0 = p
+                while p < n && data[p] != u8('\r') {
+                    if p - l0 > MAX_HEADER_BYTES { return -3 }
+                    p += 1
+                }
+                if p + 1 >= n { return -1 }
+                if data[p + 1] != u8('\n') { return -2 }
+                p += 2
+                if p - 2 == l0 {
+                    out[0].total = total
+                    out[0].end = p
+                    return 0
+                }
+            }
+        }
+        total += size
+        if total > MAX_BODY_BYTES { return -3 }
+        if p + size + 2 > n { return -1 }
+        p += size
+        if data[p] != u8('\r') || data[p + 1] != u8('\n') { return -2 }
+        p += 2
+    }
+    return -2
+}
+
+// Moves a (checked) chunked body's data together at `at`, in place. Returns its length.
+new function join_chunks(data: ptr<u8>, at: int, end: int) -> int {
+    var p = at
+    var w = at
+    while p < end {
+        var size = 0
+        while hex_digit(data[p]) >= 0 {
+            size = size * 16 + hex_digit(data[p])
+            p += 1
+        }
+        while data[p] != u8('\r') { p += 1 }
+        p += 2
+        if size == 0 { break }
+        for k in 0..size { data[w + k] = data[p + k] }
+        w += size
+        p += size + 2
+    }
+    return w - at
+}
+
+new function reject(c: ptr<Conn>, status: int, date: ptr<u8>) -> bool {
+    var extra = buffer(16)
+    var state = ResponseState(ptr<Buffer>(&c[0].output), ptr<Buffer>(&extra), -1, date, false, false, false, false, false)
+    Response(ptr<ResponseState>(&state)).status(status)
+    free_bytes(extra.data)
+    c[0].input.len = 0
+    c[0].header_scan = 0
+    return false
+}

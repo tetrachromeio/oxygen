@@ -1,0 +1,183 @@
+new function close_conn(poller: var Poller, c: ptr<Conn>, fd: int) {
+    poller.forget(fd)
+    sock_close(fd)
+    c[0].open = false
+    c[0].input.len = 0
+    c[0].output.len = 0
+    c[0].sent = 0
+    c[0].closing = false
+    c[0].continued = false
+    c[0].header_scan = 0
+    if c[0].input.cap > BUF_SHRINK_THRESHOLD {
+        free_bytes(c[0].input.data)
+        c[0].input = buffer(DEFAULT_BUF_BYTES)
+    }
+    if c[0].output.cap > BUF_SHRINK_THRESHOLD {
+        free_bytes(c[0].output.data)
+        c[0].output = buffer(DEFAULT_BUF_BYTES)
+    }
+}
+
+// Sends what's pending. Returns false if the connection failed.
+new function flush_conn(poller: var Poller, c: ptr<Conn>, fd: int) -> bool {
+    let left = c[0].output.len - c[0].sent
+    if left > 0 {
+        let k = sock_send(fd, ptr<u8>(&c[0].output.data[c[0].sent]), left)
+        if k == -1 { return false }
+        if k > 0 { c[0].sent += k }
+    }
+    if c[0].sent < c[0].output.len {
+        // Still backed up. Once the backlog is large, stop reading from this
+        // connection until it's sent: otherwise a client that keeps sending
+        // pipelined requests without ever reading its responses can make us
+        // keep buffering its unsent input too, as fast as it likes.
+        let backlog = c[0].output.len - c[0].sent
+        poller.watch(fd, fd, backlog < MAX_PENDING_OUTPUT_BYTES, true)
+        return true
+    }
+    c[0].output.len = 0
+    c[0].sent = 0
+    return true
+}
+
+new type Worker {
+    listen_fd: int
+    handler: Handler
+    context: Shared<u8>   // serve_with's context; sharing it is the caller's promise
+}
+
+// One thread's event loop. Never returns unless the listener fails.
+new function run_loop(w: Worker) -> int {
+    let lfd = w.listen_fd
+    let handler = w.handler
+    var poller = Poller()
+    poller.watch(lfd, -1, true, false)
+    var conns = List<Conn>()
+    var headers: [Header; 64] = [Header("", "")]
+    var extra = buffer(256)
+    var date: [u8; 29] = [0]
+    let datep = ptr<u8>(&date[0])
+    http_date(datep)
+    var second = unix_time()
+    while true {
+        let n = poller.wait(1000)
+        let t = unix_time()
+        if t != second {
+            second = t
+            http_date(datep)
+        }
+        for i in 0..n {
+            let tok = poller.token(i)
+            if tok < 0 {
+                // New connections.
+                while true {
+                    let fd = sock_accept(lfd)
+                    if fd < 0 { break }
+                    while int(conns.len()) <= fd {
+                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false, 0))
+                    }
+                    let c = conns.at(uint(fd))
+                    if c[0].input.data == null {
+                        c[0].input = buffer(DEFAULT_BUF_BYTES)
+                        c[0].output = buffer(DEFAULT_BUF_BYTES)
+                    }
+                    c[0].open = true
+                    poller.watch(fd, fd, true, false)
+                }
+                continue
+            }
+            let fd = tok
+            if fd >= int(conns.len()) { continue }
+            let c = conns.at(uint(fd))
+            if !c[0].open { continue }
+            let ready = poller.ready(i)
+            if (ready & WRITABLE) != 0 {
+                if !flush_conn(poller, c, fd) {
+                    close_conn(poller, c, fd)
+                    continue
+                }
+                if c[0].output.len == 0 {
+                    if c[0].closing {
+                        close_conn(poller, c, fd)
+                        continue
+                    }
+                    poller.watch(fd, fd, true, false)
+                }
+            }
+            if (ready & (READABLE | HUNG_UP)) != 0 {
+                reserve(ptr<Buffer>(&c[0].input), 4096)
+                var room = c[0].input.cap - c[0].input.len
+                if room > MAX_RECV_BYTES { room = MAX_RECV_BYTES }
+                let got = sock_recv(fd, ptr<u8>(&c[0].input.data[c[0].input.len]), room)
+                if got == 0 {
+                    // The client half-closed its write side (FIN): no more
+                    // requests are coming, but it may still be reading a
+                    // response we haven't finished sending (e.g. it wrote its
+                    // request, called shutdown(SHUT_WR), and is waiting to
+                    // read). Closing immediately would truncate that. Stop
+                    // reading, but let the usual WRITABLE path finish sending
+                    // and close once it's done.
+                    if c[0].output.len > c[0].sent {
+                        c[0].closing = true
+                        poller.watch(fd, fd, false, true)
+                    } else {
+                        close_conn(poller, c, fd)
+                    }
+                    continue
+                }
+                if got == -1 {
+                    close_conn(poller, c, fd)
+                    continue
+                }
+                if got > 0 {
+                    c[0].input.len += got
+                    let keep = answer(c, fd, handler, ptr<Header>(&headers[0]), ptr<Buffer>(&extra), datep, w.context.ptr)
+                    if !flush_conn(poller, c, fd) {
+                        close_conn(poller, c, fd)
+                        continue
+                    }
+                    if !keep {
+                        if c[0].output.len == 0 { close_conn(poller, c, fd) } else { c[0].closing = true }
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}
+
+// Serves HTTP on host:port with `threads` event loops (0: one per CPU core).
+// Returns only if it can't start (non-zero).
+pub new function serve(host: str, port: int, threads: int, handler: own Handler) -> int {
+    return serve_with(host, port, threads, null, handler)
+}
+
+// Like serve, with `context` given to every request as req.context: the way to
+// reach shared state (a loaded model, a cache) from a handler, which can't
+// capture variables. With several threads, the state must be safe to share.
+pub new function serve_with(host: str, port: int, threads: int, context: ptr<u8>, handler: own Handler) -> int {
+    var count = threads
+    if count <= 0 { count = cpu_count() }
+    // Linux spreads connections across sockets sharing a port; elsewhere the
+    // loops share one listening socket.
+    let share = port_sharing_spreads()
+    var listeners = List<Listener>()
+    for t in 0..count {
+        if t == 0 || share {
+            match listen_on(host, port, share) {
+                Err(e) => {
+                    eprint("oxygen: cannot listen on {host}:{port}: {e}")
+                    return 1
+                }
+                Ok(l) => { listeners.push(l) }
+            }
+        }
+    }
+    var workers = List<Thread<int>>()
+    for t in 1..count {
+        var fd = listeners[0].fd()
+        if share { fd = listeners[uint(t)].fd() }
+        workers.push(spawn(Worker(fd, handler, Shared<u8>(context)), run_loop))
+    }
+    return run_loop(Worker(listeners[0].fd(), handler, Shared<u8>(context)))
+}

@@ -1,0 +1,65 @@
+// A growable byte buffer that keeps its memory between uses.
+pub new type Buffer {
+    pub data: ptr<u8>
+    pub len: int
+    pub cap: int
+}
+
+new function buffer(cap: int) -> Buffer { return Buffer(alloc_bytes(usize(cap)), 0, cap) }
+
+new function reserve(b: ptr<Buffer>, extra: int) {
+    let need = b[0].len + extra
+    if need <= b[0].cap { return }
+    var cap = b[0].cap * 2
+    while cap < need { cap = cap * 2 }
+    let data = alloc_bytes(usize(cap))
+    copy(data, b[0].data, usize(b[0].len))
+    free_bytes(b[0].data)
+    b[0].data = data
+    b[0].cap = cap
+}
+
+new function put(b: ptr<Buffer>, text: str) {
+    let n = int(text.len)
+    if n == 0 { return }
+    reserve(b, n)
+    copy(ptr<u8>(&b[0].data[b[0].len]), text.data, usize(n))
+    b[0].len += n
+}
+
+new function put_int(b: ptr<Buffer>, value: int) {
+    var digits: [u8; 24] = [0]
+    var v = value
+    var n = 0
+    if v == 0 {
+        digits[0] = u8('0')
+        n = 1
+    }
+    while v > 0 {
+        digits[n] = u8(int('0') + v % 10)
+        v = v / 10
+        n += 1
+    }
+    reserve(b, n)
+    for i in 0..n { b[0].data[b[0].len + i] = digits[n - 1 - i] }
+    b[0].len += n
+}
+
+new function put_hex(b: ptr<Buffer>, value: int) {
+    var digits: [u8; 24] = [0]
+    var v = value
+    var n = 0
+    if v == 0 {
+        digits[0] = u8('0')
+        n = 1
+    }
+    while v > 0 {
+        let d = v % 16
+        if d < 10 { digits[n] = u8(int('0') + d) } else { digits[n] = u8(int('a') + d - 10) }
+        v = v / 16
+        n += 1
+    }
+    reserve(b, n)
+    for i in 0..n { b[0].data[b[0].len + i] = digits[n - 1 - i] }
+    b[0].len += n
+}

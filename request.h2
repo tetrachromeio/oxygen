@@ -1,0 +1,135 @@
+pub new type Header {
+    pub name: str
+    pub value: str
+}
+
+// One request: views into the connection's input buffer.
+pub new class Request {
+    pub method: str
+    pub target: str       // path and query, as sent
+    pub path: str
+    pub query: str        // after '?', or ""
+    pub body: str
+    pub minor: int        // HTTP/1.minor
+    headers: ptr<Header>
+    pub header_count: int
+    pub context: ptr<u8>  // what serve_with was given (the app's shared state), or null
+
+    pub new function is(method: str, path: str) -> bool { return self.method == method && self.path == path }
+    // GET, or HEAD (answered the same way, without the body).
+    pub new function get(path: str) -> bool {
+        return self.path == path && (self.method == "GET" || self.method == "HEAD")
+    }
+    pub new function post(path: str) -> bool { return self.is("POST", path) }
+
+    // The value of the header `name` (any case), or "" if it isn't there.
+    pub new function header(name: str) -> str {
+        for i in 0..self.header_count {
+            let h = self.headers[i]
+            if same_ignoring_case(h.name, name) { return h.value }
+        }
+        return ""
+    }
+    pub new function header_at(i: int) -> Header { return self.headers[i] }
+
+    // Query parameter `name`, percent-decoded ('+' as a space), or None.
+    pub new function param_text(name: str) -> Option<string> {
+        match self.param(name) {
+            None => { return None }
+            Some(raw) => { return Some(url_decode(raw, true)) }
+        }
+    }
+
+    // The path, percent-decoded.
+    pub new function decoded_path() -> string { return url_decode(self.path, false) }
+
+    // The raw (not percent-decoded) value of query parameter `name`, or None.
+    pub new function param(name: str) -> Option<str> {
+        var start: uint = 0
+        let q = self.query
+        while start <= q.len {
+            var end = start
+            while end < q.len && q[end] != u8('&') { end += 1 }
+            let part = slice(q, start, end)
+            if part.len > name.len && starts_with(part, name) && part[name.len] == u8('=') {
+                return Some(slice(part, name.len + 1, part.len))
+            }
+            if part == name { return Some("") }
+            start = end + 1
+        }
+        return None
+    }
+}
+
+new function hex_digit(c: u8) -> int {
+    if c >= u8('0') && c <= u8('9') { return int(c) - int('0') }
+    if c >= u8('a') && c <= u8('f') { return int(c) - int('a') + 10 }
+    if c >= u8('A') && c <= u8('F') { return int(c) - int('A') + 10 }
+    return -1
+}
+
+// Percent-decoding: "%20" -> " " (and '+' -> ' ' with plus_as_space, as in query
+// strings and forms). Malformed escapes are kept as they are.
+pub new function url_decode(text: str, plus_as_space: bool) -> string {
+    var out = string("")
+    var run: uint = 0
+    var i: uint = 0
+    while i < text.len {
+        let c = text[i]
+        if c == u8('%') && i + 2 < text.len {
+            let hi = hex_digit(text[i + 1])
+            let lo = hex_digit(text[i + 2])
+            if hi >= 0 && lo >= 0 {
+                out.append(slice(text, run, i))
+                var b: [u8; 1] = [u8(hi * 16 + lo)]
+                out.append(str(ptr<u8>(&b[0]), 1))
+                i += 3
+                run = i
+                continue
+            }
+        }
+        if c == u8('+') && plus_as_space {
+            out.append(slice(text, run, i))
+            out.append(" ")
+            run = i + 1
+        }
+        i += 1
+    }
+    out.append(slice(text, run, text.len))
+    return out
+}
+
+new function has_crlf(text: str) -> bool {
+    for i in 0..text.len { if text[i] == u8('\r') || text[i] == u8('\n') { return true } }
+    return false
+}
+
+// Is c a valid header-name character (RFC 9110 "tchar")? Rejecting anything
+// else (spaces, control characters, ':') keeps a header name from meaning one
+// thing to us and something else to a front-end proxy parsing the same bytes.
+new function is_tchar(c: u8) -> bool {
+    if c >= u8('a') && c <= u8('z') { return true }
+    if c >= u8('A') && c <= u8('Z') { return true }
+    if c >= u8('0') && c <= u8('9') { return true }
+    if c == u8('!') || c == u8('#') || c == u8('$') || c == u8('%') || c == u8('&') || c == u8('\'') ||
+       c == u8('*') || c == u8('+') || c == u8('-') || c == u8('.') || c == u8('^') || c == u8('_') ||
+       c == u8('`') || c == u8('|') || c == u8('~') { return true }
+    return false
+}
+
+new function valid_header_name(name: str) -> bool {
+    if name.len == 0 { return false }
+    for i in 0..name.len { if !is_tchar(name[i]) { return false } }
+    return true
+}
+
+new function lower(c: u8) -> u8 {
+    if c >= u8('A') && c <= u8('Z') { return c + 32 }
+    return c
+}
+
+pub new function same_ignoring_case(a: str, b: str) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if lower(a[i]) != lower(b[i]) { return false } }
+    return true
+}

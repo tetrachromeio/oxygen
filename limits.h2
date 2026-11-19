@@ -1,0 +1,32 @@
+// Tunable limits, shared by every file in this module.
+
+pub const MAX_HEADERS = 64
+pub const MAX_HEADER_BYTES = 65536
+pub const MAX_BODY_BYTES = 16777216
+// A chunk's extensions (after ';', before the CRLF) are skipped unparsed; this
+// bounds how many bytes of them we'll scan before giving up, so a chunk header
+// that never reaches its CRLF can't grow the input buffer without limit.
+const MAX_CHUNK_EXT_BYTES = 4096
+// Once a connection has this much unsent output queued, stop answering further
+// pipelined requests from the same read and let it flush first. Without this, a
+// client that pipelines many requests and never reads its socket can make the
+// server buffer all of their responses in memory at once.
+const MAX_PENDING_OUTPUT_BYTES = 1048576
+// How long a blocking send() for Server-Sent Events may wait before we give up
+// on a reader that's stopped reading. Without a limit, a client that opens an
+// events connection and then never reads it can block that send() forever,
+// freezing this thread's event loop (and every other connection on it) for good.
+const SSE_SEND_TIMEOUT_SECONDS = 30
+// A connection's input/output buffers start at this size and are reused
+// across requests on it. If one ever grows past BUF_SHRINK_THRESHOLD (to
+// handle a large request or response), close_conn() shrinks it back down
+// rather than letting every connection that was ever used for something
+// large permanently keep that peak allocation for as long as the server runs.
+const DEFAULT_BUF_BYTES = 16384
+const BUF_SHRINK_THRESHOLD = 65536
+// The most one sock_recv() call will try to read at once, regardless of how
+// much spare capacity a connection's input buffer happens to already have
+// from an earlier large request. Keeps one read from pulling in an entire
+// multi-megabyte pipelined burst before MAX_PENDING_OUTPUT_BYTES backpressure
+// (in answer()/flush_conn()) ever gets a chance to apply.
+const MAX_RECV_BYTES = 65536
