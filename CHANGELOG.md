@@ -4,6 +4,42 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-19 — `Oxygen.Codec`
+
+From [#5](https://github.com/tetrachromeio/oxygen/issues/5), part of the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Added
+
+- **`Oxygen.Codec`**, a new opt-in submodule: `cookie()`/`set_cookie()`,
+  `parse_form()`, `parse_multipart()`/`parse_multipart_body()`, and
+  `json_body()` (a one-line convenience over `Elemental.Json`'s existing
+  `JsonReader`, not a reimplementation).
+- `set_cookie()` reuses `Response.header()`'s CR/LF rejection and
+  additionally drops `;` in the name/value, since that corrupts the
+  cookie's own structure even without being a header-injection risk.
+- `parse_multipart()` is strict: a malformed body returns `None` rather
+  than a best-effort guess, per the issue's explicit ask given multipart
+  parsing's history of parser-differential bugs. Handles both quoted and
+  unquoted `boundary=` in `Content-Type`.
+
+No core changes needed — fully additive.
+
+Verified in `examples/codec` (11 cases, all passing): cookie present/absent,
+`set_cookie`'s exact header value (including the Max-Age path), a `;` in a
+cookie value correctly dropping it instead of corrupting it, percent-decoded
+form parsing, a two-part multipart body (one with a filename), a malformed
+multipart body rejected, a quoted boundary, and the JSON convenience. Caught
+two bugs in the test itself while writing it, not in the module: a wrong
+`Content-Length` that silently truncated a request body by one byte, and
+one that was one byte *too long* and hung the test waiting for a byte that
+would never arrive — both from getting `Content-Length` arithmetic wrong by
+hand, not anything the module did. Also caught a real test-ordering mistake
+that would have looked like a module bug: calling `res.text()` before
+`set_cookie()` meant the cookie was silently dropped (headers are ignored
+once a response is sent, same rule as `res.header()` always had) — fixed by
+reordering the test, not the module.
+
 ## 2026-11-19 — idle/header timeouts, graceful shutdown, `match_prefix`
 
 From [#1](https://github.com/tetrachromeio/oxygen/issues/1).

@@ -1,0 +1,270 @@
+// Oxygen.Codec: cookies, form/multipart body parsing, and a JSON
+// convenience, as an opt-in submodule (`use Oxygen` alone never pulls this
+// in).
+//
+//     use Oxygen
+//     use Oxygen.Codec
+//
+//     new function handle(req: Request, res: Response) {
+//         match cookie(req, "session") {
+//             Some(id) => { res.text("session=" + string(id)) }
+//             None => { res.status(401) }
+//         }
+//         set_cookie(res, "seen", "1", default_cookie_options())
+//     }
+//
+// JSON isn't reimplemented here: Elemental.Json's JsonReader/JsonWriter
+// (hydrogen repo) already work directly against `req.body`/`res.json()` —
+// `var r = JsonReader(req.body)` is the whole integration. json_body(req)
+// below is a one-line convenience for that, not a new abstraction.
+use Elemental
+use Elemental.Json
+use Oxygen
+
+// ---------------------------------------------------------------- cookies
+
+// The value of cookie `name` from the request's Cookie header, or None.
+// Zero-copy: a view into req.header("Cookie"), which is itself a view into
+// the connection's input buffer.
+pub new function cookie(req: Request, name: str) -> Option<str> {
+    let header = req.header("Cookie")
+    var start: uint = 0
+    while start <= header.len {
+        var end = start
+        while end < header.len && header[end] != u8(';') { end += 1 }
+        var part = slice(header, start, end)
+        var p0: uint = 0
+        while p0 < part.len && part[p0] == u8(' ') { p0 += 1 }
+        part = slice(part, p0, part.len)
+        var eq: uint = 0
+        while eq < part.len && part[eq] != u8('=') { eq += 1 }
+        if eq < part.len && slice(part, 0, eq) == name {
+            return Some(slice(part, eq + 1, part.len))
+        }
+        start = end + 1
+    }
+    return None
+}
+
+pub new type CookieOptions {
+    pub http_only: bool
+    pub secure: bool
+    pub same_site: str     // "Strict", "Lax", "None", or "" to omit
+    pub path: str          // "" to omit
+    pub domain: str        // "" to omit
+    pub max_age_seconds: int  // 0 to omit (a session cookie); negative explicitly deletes it
+    pub has_max_age: bool      // whether to include Max-Age at all (0 is a valid value, not "omit")
+}
+
+// HttpOnly, Secure, SameSite=Lax, Path=/, no Domain, no Max-Age (a session
+// cookie). Narrow or widen per use — a cookie read by JS needs
+// http_only: false; one that should survive the browser closing needs
+// has_max_age: true.
+pub new function default_cookie_options() -> CookieOptions {
+    return CookieOptions(true, true, "Lax", "/", "", 0, false)
+}
+
+new function has_bad_cookie_char(s: str) -> bool {
+    for i in 0..s.len {
+        let c = s[i]
+        if c == u8('\r') || c == u8('\n') || c == u8(';') { return true }
+    }
+    return false
+}
+
+// Builds a Set-Cookie header and adds it via res.header(), which already
+// rejects CR/LF (so this reuses that, rather than reimplementing a weaker
+// version of it) — and additionally rejects ';' in name/value here, since a
+// raw one would corrupt the cookie's own structure (truncating or altering
+// attributes) even without being a header-injection risk. A name or value
+// containing either is dropped: no Set-Cookie is sent at all, rather than
+// sending a corrupted one.
+pub new function set_cookie(res: Response, name: str, value: str, opts: CookieOptions) {
+    if has_bad_cookie_char(name) || has_bad_cookie_char(value) { return }
+    var v = string(name)
+    v.append("=")
+    v.append(value)
+    if opts.path.len > 0 {
+        v.append("; Path=")
+        v.append(opts.path)
+    }
+    if opts.domain.len > 0 {
+        v.append("; Domain=")
+        v.append(opts.domain)
+    }
+    if opts.has_max_age {
+        v.append("; Max-Age={opts.max_age_seconds}")
+    }
+    if opts.same_site.len > 0 {
+        v.append("; SameSite=")
+        v.append(opts.same_site)
+    }
+    if opts.secure { v.append("; Secure") }
+    if opts.http_only { v.append("; HttpOnly") }
+    res.header("Set-Cookie", v.view())
+}
+
+// ---------------------------------------------------------------- application/x-www-form-urlencoded
+
+pub new type FormField {
+    pub name: string
+    pub value: string
+}
+
+// Parses "a=1&b=2" into [("a","1"), ("b","2")], percent-decoding both sides
+// ('+' as a space, as form bodies use it) with the core's own url_decode.
+pub new function parse_form(body: str) -> List<FormField> {
+    var out = List<FormField>()
+    var start: uint = 0
+    while start <= body.len {
+        var end = start
+        while end < body.len && body[end] != u8('&') { end += 1 }
+        let part = slice(body, start, end)
+        if part.len > 0 {
+            var eq: uint = 0
+            while eq < part.len && part[eq] != u8('=') { eq += 1 }
+            let raw_name = slice(part, 0, eq)
+            var raw_value = ""
+            if eq < part.len { raw_value = slice(part, eq + 1, part.len) }
+            out.push(FormField(url_decode(raw_name, true), url_decode(raw_value, true)))
+        }
+        start = end + 1
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- multipart/form-data
+
+pub new type MultipartPart {
+    pub name: str          // from Content-Disposition's name="..."
+    pub filename: str      // from filename="...", or "" if this part has none
+    pub content_type: str  // from the part's own Content-Type header, or "" if absent
+    pub data: str          // a view into the request body: no copy, even for a large upload
+}
+
+new function same_ignoring_case_prefix(line: str, prefix: str) -> bool {
+    if prefix.len > line.len { return false }
+    return same_ignoring_case(slice(line, 0, prefix.len), prefix)
+}
+
+new function trim_leading_space(s: str) -> str {
+    var i: uint = 0
+    while i < s.len && (s[i] == u8(' ') || s[i] == u8('\t')) { i += 1 }
+    return slice(s, i, s.len)
+}
+
+new function extract_quoted(line: str, key: str) -> Option<str> {
+    match find(line, key) {
+        None => { return None }
+        Some(at) => {
+            let start = at + key.len
+            var e = start
+            while e < line.len && line[e] != u8('"') { e += 1 }
+            if e >= line.len { return None }
+            return Some(slice(line, start, e))
+        }
+    }
+}
+
+// Where `delim` next appears at or after `from`, or None.
+new function find_from(body: str, from: uint, delim: str) -> Option<uint> {
+    match find(slice(body, from, body.len), delim) {
+        None => { return None }
+        Some(rel) => { return Some(from + rel) }
+    }
+}
+
+// `boundary=...` from a Content-Type header (quoted or not), or None if
+// there isn't one.
+new function extract_boundary(content_type: str) -> Option<str> {
+    match find(content_type, "boundary=") {
+        None => { return None }
+        Some(at) => {
+            var start = at + uint(9) // len("boundary=")
+            if start < content_type.len && content_type[start] == u8('"') {
+                start += 1
+                var e = start
+                while e < content_type.len && content_type[e] != u8('"') { e += 1 }
+                if e >= content_type.len { return None }
+                return Some(slice(content_type, start, e))
+            }
+            var e = start
+            while e < content_type.len && content_type[e] != u8(';') && content_type[e] != u8(' ') { e += 1 }
+            return Some(slice(content_type, start, e))
+        }
+    }
+}
+
+// Parses a multipart/form-data body against `boundary` (see extract_boundary,
+// or call parse_multipart(req) which gets it from the request itself).
+// Strict: a malformed body (no final boundary, a part missing the blank
+// line ending its headers, a data section not properly terminated) returns
+// None instead of guessing at a best-effort parse — multipart boundary
+// parsing has a real history of parser-differential bugs, so this doesn't
+// try to be lenient about where the spec is precise.
+pub new function parse_multipart_body(body: str, boundary: str) -> Option<List<MultipartPart>> {
+    var out = List<MultipartPart>()
+    var delim = string("--")
+    delim.append(boundary)
+    let d = delim.view()
+    if !starts_with(body, d) { return None }
+    var p = d.len
+    while true {
+        if p + 1 < body.len && body[p] == u8('-') && body[p + 1] == u8('-') {
+            return Some(out) // the final boundary
+        }
+        if p + 1 >= body.len || body[p] != u8('\r') || body[p + 1] != u8('\n') { return None }
+        p += 2
+        var name = ""
+        var filename = ""
+        var ctype = ""
+        while true {
+            var le = p
+            while le < body.len && body[le] != u8('\r') { le += 1 }
+            if le + 1 >= body.len || body[le + 1] != u8('\n') { return None }
+            if le == p {
+                p = le + 2
+                break // the blank line ending this part's headers
+            }
+            let line = slice(body, p, le)
+            if same_ignoring_case_prefix(line, "Content-Disposition:") {
+                match extract_quoted(line, "name=\"") {
+                    Some(v) => { name = v }
+                    None => {}
+                }
+                match extract_quoted(line, "filename=\"") {
+                    Some(v) => { filename = v }
+                    None => {}
+                }
+            } else if same_ignoring_case_prefix(line, "Content-Type:") {
+                ctype = trim_leading_space(slice(line, 13, line.len))
+            }
+            p = le + 2
+        }
+        match find_from(body, p, d) {
+            None => { return None }
+            Some(at) => {
+                if at < 2 || body[at - 2] != u8('\r') || body[at - 1] != u8('\n') { return None }
+                out.push(MultipartPart(name, filename, ctype, slice(body, p, at - 2)))
+                p = at + d.len
+            }
+        }
+    }
+    return None
+}
+
+// Like parse_multipart_body, but gets the boundary from the request's own
+// Content-Type header. None if there's no boundary, or the body doesn't
+// parse against it.
+pub new function parse_multipart(req: Request) -> Option<List<MultipartPart>> {
+    match extract_boundary(req.header("Content-Type")) {
+        None => { return None }
+        Some(b) => { return parse_multipart_body(req.body, b) }
+    }
+}
+
+// ---------------------------------------------------------------- JSON
+
+// JsonReader(req.body) directly — a one-line convenience, not a new
+// abstraction. See Elemental.Json for the reader/writer API itself.
+pub new function json_body(req: Request) -> JsonReader { return JsonReader(req.body) }

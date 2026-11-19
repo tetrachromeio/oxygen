@@ -1,0 +1,208 @@
+// Oxygen.Codec's self-test, and a small demo of cookies, form parsing,
+// multipart, and JSON.
+use Elemental
+use Elemental.Net
+use Elemental.System
+use Elemental.Thread
+use Oxygen
+use Oxygen.Codec
+
+new function handle(req: Request, res: Response) {
+    if req.get("/cookie") {
+        match cookie(req, "session") {
+            Some(id) => { res.text("session=" + string(id)) }
+            None => { res.status(401) }
+        }
+    }
+    else if req.get("/set-cookie") {
+        set_cookie(res, "seen", "1", default_cookie_options())
+        res.text("ok")
+    }
+    else if req.get("/bad-cookie") {
+        set_cookie(res, "x", "a;b", default_cookie_options()) // ';' in value: dropped
+        res.text("ok")
+    }
+    else if req.get("/persistent-cookie") {
+        var opts = default_cookie_options()
+        opts.has_max_age = true
+        opts.max_age_seconds = 3600
+        set_cookie(res, "remember", "yes", opts)
+        res.text("ok")
+    }
+    else if req.post("/form") {
+        let fields = parse_form(req.body)
+        var out = string("")
+        for i in 0..int(fields.len()) {
+            let f = fields.at(uint(i))
+            if i > 0 { out.append("&") }
+            out.append(f[0].name.view())
+            out.append("=")
+            out.append(f[0].value.view())
+        }
+        res.text(out.view())
+    }
+    else if req.post("/multipart") {
+        match parse_multipart(req) {
+            None => { res.status(400) }
+            Some(parts) => {
+                var out = string("")
+                for i in 0..int(parts.len()) {
+                    let p = parts.at(uint(i))
+                    if i > 0 { out.append("|") }
+                    out.append("name=" + string(p[0].name))
+                    out.append(" filename=" + string(p[0].filename))
+                    out.append(" ctype=" + string(p[0].content_type))
+                    out.append(" data=" + string(p[0].data))
+                }
+                res.text(out.view())
+            }
+        }
+    }
+    else if req.get("/json") {
+        var r = json_body(req)
+        var name = string("")
+        r.begin_object()
+        var key = string("")
+        while r.next_key(key) {
+            if key == "name" { r.read_string(name) }
+            else { r.skip() }
+        }
+        res.text("name=" + string(name))
+    }
+    else { res.not_found() }
+}
+
+new function run_server(port: int) -> int { return serve("127.0.0.1", port, 1, handle) }
+
+new function check(port: int, title: str, request: str, want_status: int, want_body: str) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            var ok = starts_with(text, "HTTP/1.1 {want_status}")
+            if want_body.len > 0 && !ends_with(text, want_body) { ok = false }
+            if ok { print("PASS {title}") }
+            else {
+                print("FAIL {title}: want status {want_status}, body ending with: {want_body}")
+                print("  got:")
+                for line in split(text, "\r\n") { print("    {line}") }
+            }
+            return ok
+        }
+    }
+}
+
+new function check_no_header(port: int, title: str, request: str, header_name: str) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            var found = false
+            for line in split(reply.view(), "\r\n") {
+                if starts_with(line, header_name) { found = true }
+            }
+            if !found { print("PASS {title}") }
+            else {
+                print("FAIL {title}: did not expect {header_name}, got:")
+                for line in split(reply.view(), "\r\n") { print("    {line}") }
+            }
+            return !found
+        }
+    }
+}
+
+new function main() -> int {
+    var port = 0
+    match listen("127.0.0.1", 0) {
+        Err(e) => {
+            print("no free port: {e}")
+            return 1
+        }
+        Ok(l) => { port = l.port }
+    }
+    let server = spawn(port, run_server)
+    var up = false
+    for attempt in 0..200 {
+        match connect("127.0.0.1", port) {
+            Err(e) => { sleep(0.01) }
+            Ok(c) => { up = true; break }
+        }
+    }
+    if !up {
+        print("server didn't start")
+        exit_now(1)
+    }
+
+    var failures = 0
+    if !check(port, "cookie present", "GET /cookie HTTP/1.1\r\nCookie: a=1; session=abc123; b=2\r\nConnection: close\r\n\r\n", 200, "session=abc123") { failures += 1 }
+    if !check(port, "cookie absent", "GET /cookie HTTP/1.1\r\nCookie: a=1\r\nConnection: close\r\n\r\n", 401, "") { failures += 1 }
+    if !check(port, "set_cookie builds attributes", "GET /set-cookie HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "ok") { failures += 1 }
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("FAIL set-cookie value check: connect failed: {e}"); failures += 1 }
+        Ok(c) => {
+            c.write("GET /set-cookie HTTP/1.1\r\nConnection: close\r\n\r\n")
+            var reply = string("")
+            c.read_all(reply)
+            var line_found = ""
+            for line in split(reply.view(), "\r\n") {
+                if starts_with(line, "Set-Cookie") { line_found = line }
+            }
+            let want = "Set-Cookie: seen=1; Path=/; SameSite=Lax; Secure; HttpOnly"
+            if line_found == want { print("PASS set_cookie value is exactly: {want}") }
+            else {
+                print("FAIL set_cookie value: want [{want}], got [{line_found}]")
+                failures += 1
+            }
+        }
+    }
+    if !check_no_header(port, "set_cookie with ';' in value is dropped, not corrupted", "GET /bad-cookie HTTP/1.1\r\nConnection: close\r\n\r\n", "Set-Cookie") { failures += 1 }
+    if !check(port, "form body, percent-decoded", "POST /form HTTP/1.1\r\nContent-Length: 22\r\nConnection: close\r\n\r\nname=caf%C3%A9&x=1%2B2", 200, "name=caf\xc3\xa9&x=1+2") { failures += 1 }
+
+    let mp_body = "--B\r\nContent-Disposition: form-data; name=\"field1\"\r\n\r\nhello\r\n--B\r\nContent-Disposition: form-data; name=\"file1\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nfile contents\r\n--B--\r\n"
+    let mp_req = "POST /multipart HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: {mp_body.len}\r\nConnection: close\r\n\r\n" + mp_body
+    if !check(port, "multipart: two parts, one with a filename", mp_req, 200, "name=field1 filename= ctype= data=hello|name=file1 filename=a.txt ctype=text/plain data=file contents") { failures += 1 }
+
+    let bad_mp = "POST /multipart HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: 11\r\nConnection: close\r\n\r\nnot-a-part!"
+    if !check(port, "multipart: malformed body rejected, not guessed at", bad_mp, 400, "") { failures += 1 }
+
+    let qmp_body = "--Q\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--Q--\r\n"
+    let qmp_req = "POST /multipart HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=\"Q\"\r\nContent-Length: {qmp_body.len}\r\nConnection: close\r\n\r\n" + qmp_body
+    if !check(port, "multipart: quoted boundary in Content-Type", qmp_req, 200, "name=a filename= ctype= data=v") { failures += 1 }
+
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("FAIL persistent-cookie: connect failed: {e}"); failures += 1 }
+        Ok(c) => {
+            c.write("GET /persistent-cookie HTTP/1.1\r\nConnection: close\r\n\r\n")
+            var reply = string("")
+            c.read_all(reply)
+            var line_found = ""
+            for line in split(reply.view(), "\r\n") {
+                if starts_with(line, "Set-Cookie") { line_found = line }
+            }
+            let want = "Set-Cookie: remember=yes; Path=/; Max-Age=3600; SameSite=Lax; Secure; HttpOnly"
+            if line_found == want { print("PASS persistent cookie includes Max-Age: {want}") }
+            else {
+                print("FAIL persistent cookie: want [{want}], got [{line_found}]")
+                failures += 1
+            }
+        }
+    }
+
+    if !check(port, "json_body convenience", "GET /json HTTP/1.1\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{{\"name\":\"oxy\"}}", 200, "name=oxy") { failures += 1 }
+
+    print("")
+    if failures == 0 { print("all passed") } else { print("{failures} failed") }
+    exit_now(failures)
+    return 0
+}

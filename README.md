@@ -161,6 +161,53 @@ connection that was simply sitting idle at the time (not actively mid-request)
 drains via the same idle timeout below, rather than being cut off early —
 within a bound, not held open indefinitely either.
 
+## Modules
+
+Opt-in layers on top of the core, each its own submodule — `use Oxygen` alone
+never pulls one in, so a service that doesn't need it pays nothing for it.
+
+### `Oxygen.Codec`
+
+Cookies, `application/x-www-form-urlencoded` and `multipart/form-data` body
+parsing, and a one-line JSON convenience:
+
+```
+use Oxygen
+use Oxygen.Codec
+
+new function handle(req: Request, res: Response) {
+    match cookie(req, "session") {
+        Some(id) => { res.text("session=" + string(id)) }
+        None => { res.status(401) }
+    }
+}
+```
+
+- `cookie(req, name) -> Option<str>`: zero-copy, a view into the `Cookie`
+  header.
+- `set_cookie(res, name, value, opts)`: builds and adds a `Set-Cookie`
+  header. Reuses `res.header()`'s existing CR/LF rejection (so it's never
+  weaker than that), and additionally drops `;` in the name or value, since
+  a raw one there corrupts the cookie's own structure even without being a
+  header-injection risk. Call it **before** sending the response — like any
+  other header, it's silently ignored after.
+- `parse_form(body) -> List<FormField>`: percent-decoded name/value pairs.
+- `parse_multipart(req) -> Option<List<MultipartPart>>`: each part's
+  `name`, `filename` (`""` if absent), `content_type` (`""` if absent), and
+  `data` — a zero-copy view into the request body, so a large file upload
+  isn't copied. Strict: a malformed body (wrong boundary, missing header
+  terminator, truncated data) returns `None` rather than a best-effort
+  guess — multipart parsing has a real history of parser-differential bugs.
+- `json_body(req) -> JsonReader`: `JsonReader(req.body)`, one line saved.
+  JSON itself isn't reimplemented here — Elemental.Json's `JsonReader`/
+  `JsonWriter` (hydrogen repo) already work directly against `req.body`/
+  `res.json()`.
+
+**Not here yet:** trusted-proxy header extraction lives in
+`Oxygen.Middleware` (see that section) rather than here, since it's really
+a `Forwarded`/`X-Forwarded-For` *security* concern (who do you trust),
+not a parsing one.
+
 ## Limits (for now)
 
 - No TLS: put Oxygen behind a proxy for HTTPS.
