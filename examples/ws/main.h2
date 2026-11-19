@@ -1,0 +1,52 @@
+// A WebSocket echo server demo using Oxygen.WS.   ws [port] [threads]
+//
+// Note the thread count: a WebSocket handler never returns until the
+// session ends (see the module's doc comment), so it holds its worker
+// thread for the connection's whole lifetime — unlike an ordinary request,
+// which returns in microseconds. The number of *concurrent* WebSocket
+// connections this server can hold open at once is bounded by `threads`,
+// not by load; a thread serving a WS session can't also serve any other
+// connection (WebSocket or plain HTTP) until that session ends. Size
+// `threads` for how many clients you expect to have connected at once, not
+// for CPU parallelism, if this server also needs to keep serving ordinary
+// requests while WS connections are open.
+use Elemental
+use Elemental.Net
+use Oxygen
+use Oxygen.WS
+
+new function handle(req: Request, res: Response) {
+    if !req.get("/chat") { res.not_found(); return }
+    match handshake_accept(req) {
+        None => { res.status(400) }
+        Some(accept) => {
+            res.header("Upgrade", "websocket")
+            res.header("Connection", "Upgrade")
+            res.header("Sec-WebSocket-Accept", accept.view())
+            res.send(101, "", "")
+            let fd = res.take_over()
+            sock_blocking(fd, true)
+            sock_recv_timeout(fd, 60) // give up on a silent peer after 60s
+            while true {
+                match read_message(fd) {
+                    None => { break } // closed, errored, timed out, or a malformed/unmasked frame
+                    Some(msg) => {
+                        if msg.kind == WS_CLOSE { break }
+                        if msg.kind == WS_TEXT { send_text(fd, msg.data.view()) }
+                        else if msg.kind == WS_BINARY { send_binary(fd, msg.data.view()) }
+                    }
+                }
+            }
+            sock_close(fd)
+        }
+    }
+}
+
+new function main() -> int {
+    let argv = args()
+    var port = 18095
+    var threads = 8
+    if argv.len() > 1 { port = unwrap_or(parse_int(argv[1]), port) }
+    if argv.len() > 2 { threads = unwrap_or(parse_int(argv[2]), threads) }
+    return serve("127.0.0.1", port, threads, handle)
+}

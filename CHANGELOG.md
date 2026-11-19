@@ -4,6 +4,73 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-19 — `Oxygen.WS`
+
+From [#7](https://github.com/tetrachromeio/oxygen/issues/7), part of the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Design decision (the issue's own open question, settled)
+
+Scoped to exactly "upgrade and frame codec," not a connection manager: a
+WebSocket handler takes over the raw fd (`Response.take_over()`, new on the
+core for this) and drives its own read/write loop, the same way Server-Sent
+Events already holds its connection for as long as the handler needs — just
+bidirectional. Consequence, stated plainly rather than left implicit:
+**concurrent WebSocket connections are bounded by thread count**, since a
+thread serving one WS session can't serve any other connection until that
+session ends. This answers the issue's three open questions directly (see
+the module's doc comment and the README's `Oxygen.WS` section) without a
+parallel connection-lifecycle rewrite in the core.
+
+### Added
+
+- **`Oxygen.WS`**: `handshake_accept()` (validates the upgrade request,
+  computes `Sec-WebSocket-Accept` — implements SHA-1 and base64 in pure
+  Hydrogen, since neither existed; SHA-1 only for what RFC 6455 specifies,
+  not a cryptographic choice), `read_message()` (reassembles fragments,
+  answers pings with pongs internally, rejects an **unmasked** client frame
+  per RFC 6455 §5.1 rather than leniently accepting it), and
+  `send_text`/`send_binary`/`send_ping`/`send_close`.
+- `Response.take_over()`, a small core addition: hands back the connection's
+  raw fd for a protocol upgrade, flushing whatever was already written
+  (the handshake response itself) first — see below for why that flush
+  matters.
+- `Elemental.Net.sock_recv_timeout()` (hydrogen repo), parallel to the
+  existing `sock_send_timeout()`: bounds a blocking `recv()` the same way.
+
+### Caught while building this, not after
+
+- **The handshake response was never actually sent.** `res.send(101, ...)`
+  only writes to the connection's *buffered* output; normally the core
+  flushes that after the handler returns. A WebSocket handler never
+  returns until the session ends, so without `take_over()` flushing it
+  directly, the 101 response just sat in the buffer forever — the client
+  saw nothing. Fixed by having `take_over()` flush before handing back the
+  fd.
+- **SHA-1 needs mod-2³² wraparound arithmetic, which trapped instead of
+  wrapping.** Hydrogen's checked arithmetic (debug builds) traps on
+  overflow for `u32` the same as any other integer type, and there's a
+  `wrapping_add`/`wrapping_mul` for `uint` but not for `u32`. Rewrote the
+  whole algorithm in `uint` with explicit `& 0xFFFFFFFF` masking after
+  anything that could carry past bit 31, instead of relying on `u32`'s
+  native wraparound — verified byte-for-byte against Python's `hashlib`
+  for the standard "abc" test vector before trusting it on real data.
+- **An apparent hang that was actually correct, expected behavior**: two
+  WebSocket connections open at once on a server with too few threads
+  will have the second wait for the first's session to end, since a WS
+  handler holds its thread for the connection's entire lifetime. Not a
+  bug — exactly the tradeoff above, caught empirically while testing concurrent
+  connections, which is what led to stating it explicitly rather than
+  leaving it implicit in how the module works.
+
+Verified against a real WebSocket client (Python stdlib, independent of
+this module's own `sha1`/`base64_encode` — `examples/ws/test_ws.py`, part
+of the repo so it can be rerun): the handshake's `Sec-WebSocket-Accept`
+against Python's own `hashlib`+`base64`, masked text and binary frame
+echoing, a ping answered with a pong, a fragmented message reassembled,
+an unmasked client frame rejected (connection closed), and the close
+handshake.
+
 ## 2026-11-19 — idle/header timeouts, graceful shutdown, `match_prefix`
 
 From [#1](https://github.com/tetrachromeio/oxygen/issues/1).

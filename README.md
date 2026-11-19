@@ -134,6 +134,7 @@ this repo yet.
 | `res.not_found()` `res.status(code)` | status with its reason as the body |
 | `res.header(name, value)` | extra header (before sending); ignored if `name`/`value` contain CR or LF, or if the response is already sent |
 | `res.close()` | close the connection after this response |
+| `res.take_over()` | for a protocol upgrade (see `Oxygen.WS`): marks the response sent, flushes anything already written, and returns the raw fd to manage directly from here on |
 | `res.begin_events()`, `res.event(data)`, `res.end_events()` | Server-Sent Events, each event sent at once; `event` returns false once the client has gone |
 
 A handler that doesn't answer gets a 500. Requests are answered in order;
@@ -160,6 +161,95 @@ request finish); `serve`/`serve_with` return once all of them have. A
 connection that was simply sitting idle at the time (not actively mid-request)
 drains via the same idle timeout below, rather than being cut off early —
 within a bound, not held open indefinitely either.
+
+## Modules
+
+Opt-in layers on top of the core, each its own submodule — `use Oxygen` alone
+never pulls one in, so a service that doesn't need it pays nothing for it.
+
+### `Oxygen.WS`
+
+WebSocket upgrade and frame codec (RFC 6455) — deliberately scoped to
+exactly that, not a full connection manager:
+
+```
+use Oxygen
+use Oxygen.WS
+use Elemental.Net
+
+new function handle(req: Request, res: Response) {
+    if !req.get("/chat") { res.not_found(); return }
+    match handshake_accept(req) {
+        None => { res.status(400) }
+        Some(accept) => {
+            res.header("Upgrade", "websocket")
+            res.header("Connection", "Upgrade")
+            res.header("Sec-WebSocket-Accept", accept.view())
+            res.send(101, "", "")
+            let fd = res.take_over()         // new on Response, for this
+            sock_blocking(fd, true)
+            sock_recv_timeout(fd, 60)         // bound your own reads — see below
+            while true {
+                match read_message(fd) {
+                    None => { break }         // closed, errored, timed out, or malformed/unmasked
+                    Some(msg) => {
+                        if msg.kind == WS_CLOSE { break }
+                        if msg.kind == WS_TEXT { send_text(fd, msg.data.view()) }    // echo
+                        else if msg.kind == WS_BINARY { send_binary(fd, msg.data.view()) }
+                    }
+                }
+            }
+            sock_close(fd)
+        }
+    }
+}
+```
+
+**Why "upgrade and frame codec," not a connection manager.** Oxygen's core
+serves many short request/response cycles with no per-connection
+application state beyond `Conn`; a WebSocket connection is long-lived and
+bidirectional, which doesn't fit that model the way a request handler does.
+Rather than build a parallel connection lifecycle into the core, this hands
+you the raw fd (`Response.take_over()`, new on the core for this) once the
+handshake is answered, and **you drive the read/write loop yourself** — the
+same way Server-Sent Events already holds its connection for as long as the
+handler needs, just bidirectional instead of one-directional. Concretely:
+**the number of concurrent WebSocket connections a server can hold open at
+once is bounded by its thread count**, not by load — a thread serving one
+WS session can't serve any other connection (WebSocket or plain HTTP) until
+that session ends. Size `threads` for how many clients you expect connected
+at once if this server also serves ordinary requests while WS connections
+are open.
+
+- `handshake_accept(req) -> Option<string>`: validates the upgrade request
+  (RFC 6455 §4.2.1) and computes `Sec-WebSocket-Accept`; `None` if it isn't
+  a valid upgrade request (send your own error — 400 covers most cases, or
+  426 with `Sec-WebSocket-Version: 13` for a wrong version).
+- `read_message(fd) -> Option<WsMessage>`: reads one complete message,
+  reassembling continuation frames and answering pings with pongs
+  internally (your handler never sees a ping or pong, only `WS_TEXT`,
+  `WS_BINARY` or `WS_CLOSE`). `None` for a closed connection, a timeout, or
+  a malformed or **unmasked** frame — a client frame without the mask bit
+  set is a protocol violation (RFC 6455 §5.1), not something to leniently
+  accept.
+- `send_text(fd, text)`, `send_binary(fd, data)`, `send_ping(fd, payload)`,
+  `send_close(fd)`: write a frame directly to the socket (the server never
+  masks its own frames, per spec).
+- `MAX_MESSAGE_BYTES` (16 MB, matching the core's `MAX_BODY_BYTES`): the
+  most one message may add up to across all of its frames combined.
+
+**Known limitation**, from `Response.take_over()`'s own docs: if a client
+pipelines WebSocket frames immediately after its upgrade request, without
+waiting for the 101 response — something no mainstream client does, since
+the handshake response isn't optional to wait for — those bytes are sitting
+in the connection's internal input buffer, not on the socket, and won't be
+seen by a read on the fd `take_over()` returns. Closing that gap would need
+the core to hand back whatever's left in that buffer too, which it doesn't
+do yet.
+
+Verified against a real WebSocket client (Python stdlib, independent of
+Oxygen's own `sha1`/`base64_encode`) in `examples/ws/test_ws.py` — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to run it.
 
 ## Limits (for now)
 

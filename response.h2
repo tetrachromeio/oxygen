@@ -46,6 +46,41 @@ pub new class Response {
     // Ask to close the connection after this response.
     pub new function close() { self.s[0].keep_alive = false }
 
+    // Takes over this connection's socket for a protocol upgrade (e.g.
+    // WebSocket, see Oxygen.WS): marks the response as already sent (so the
+    // core won't also try to answer it with a 500) and asks for the
+    // connection to close once the handler returns, then gives back the raw
+    // fd to read, write and close directly from here on — none of
+    // Response's other methods do anything useful on it afterward. Send
+    // whatever response headers belong to the upgrade itself (e.g. the
+    // WebSocket handshake's 101) before calling this, not after.
+    //
+    // Known limitation: if the client sends data for the new protocol
+    // before this is called (pipelined right after its upgrade request,
+    // without waiting for the response) — something no mainstream
+    // WebSocket client does, since the handshake response isn't optional to
+    // wait for — those bytes are sitting in this connection's internal
+    // input buffer, not on the socket, and a read on the fd returned here
+    // won't see them. Closing that gap would need the core to hand back
+    // whatever's left in that buffer too, which it doesn't do yet.
+    pub new function take_over() -> int {
+        // Whatever's been written so far (the upgrade response itself) is
+        // sitting in the output buffer, waiting for the core's normal
+        // post-handler flush — which never happens here, since the handler
+        // doesn't return until the whole upgraded session is done. Flush it
+        // now, directly, or the client would never see the handshake
+        // response at all.
+        let st = self.s
+        let o = st[0].out
+        if o[0].len > 0 {
+            sock_send(st[0].fd, o[0].data, o[0].len)
+            o[0].len = 0
+        }
+        st[0].sent = true
+        st[0].keep_alive = false
+        return st[0].fd
+    }
+
     // An extra header for this response (call before sending). Ignored once the
     // response is sent, and if name or value contains CR or LF: either would let
     // a caller that puts unsanitized input here (a redirect target, say) split

@@ -75,6 +75,18 @@ If you're adding a test case, add it to `examples/selftest/main.h2`. Keep
 falling back to `not_found()`) as the *last* branch in `handle()` — like any
 `if`/`else if` chain, anything after a catch-all is unreachable.
 
+**`Oxygen.WS`** is tested a different way, since it needs a real WebSocket
+client to talk to: `examples/ws/test_ws.py` (Python stdlib only, no
+dependencies) drives a real handshake and frame exchange against a running
+`ws` demo server:
+
+```bash
+cd examples/ws
+hy build --release --native
+./build/ws &
+python3 test_ws.py
+```
+
 ## Making a change
 
 1. Open an issue first for anything beyond a small fix, so the approach gets

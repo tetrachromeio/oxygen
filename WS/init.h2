@@ -1,0 +1,419 @@
+// Oxygen.WS: WebSocket upgrade and frame codec (RFC 6455), as an opt-in
+// submodule.
+//
+// Deliberately scoped to exactly that — upgrade and frame codec — not a
+// full connection manager. Oxygen's core serves many short request/response
+// cycles with no per-connection application state beyond Conn; a WebSocket
+// connection is long-lived and bidirectional, which doesn't fit that model
+// the way a request handler does. Rather than build a parallel connection
+// lifecycle into the core (a bigger, riskier change — see the design
+// questions this issue originally raised), this hands you the raw fd via
+// Response.take_over() (new on the core for this) once the handshake is
+// answered, and you drive the read/write loop yourself from inside your
+// handler — the same way Server-Sent Events already holds its connection
+// for as long as the handler needs (see the core's docs on that), just
+// bidirectional instead of one-directional. That answers this module's
+// three open design questions directly: no dedicated thread beyond the
+// worker thread already serving this connection; no interaction with
+// MAX_PENDING_OUTPUT_BYTES backpressure, since sends go straight to the
+// socket, not through the core's output buffer; and no interaction with the
+// core's idle/incomplete-header timeout sweep, since that only ever looks
+// at Conn state for connections still inside the normal request/response
+// loop — you bound your own reads with sock_recv_timeout() instead (see the
+// example below).
+//
+//     use Oxygen
+//     use Oxygen.WS
+//     use Elemental.Net
+//
+//     new function handle(req: Request, res: Response) {
+//         if !req.get("/chat") { res.not_found(); return }
+//         match handshake_accept(req) {
+//             None => { res.status(400); return }  // not a valid WS upgrade request
+//             Some(accept) => {
+//                 res.header("Upgrade", "websocket")
+//                 res.header("Connection", "Upgrade")
+//                 res.header("Sec-WebSocket-Accept", accept.view())
+//                 res.send(101, "", "")
+//                 let fd = res.take_over()
+//                 sock_blocking(fd, true)
+//                 sock_recv_timeout(fd, 60)   // give up on a silent peer after 60s
+//                 while true {
+//                     match read_message(fd) {
+//                         None => { break }               // closed, errored, or timed out
+//                         Some(msg) => {
+//                             if msg.kind == WS_CLOSE { break }
+//                             if msg.kind == WS_TEXT { send_text(fd, msg.data.view()) }    // echo
+//                             else if msg.kind == WS_BINARY { send_binary(fd, msg.data.view()) }
+//                         }
+//                     }
+//                 }
+//                 sock_close(fd)
+//             }
+//         }
+//     }
+use Elemental
+use Elemental.Net
+use Oxygen
+
+// ---------------------------------------------------------------- handshake
+
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// Validates `req` as a WebSocket upgrade request (RFC 6455 §4.2.1) and, if
+// valid, returns the Sec-WebSocket-Accept value to send back. None if it
+// isn't a valid upgrade request at all — send your own error response
+// (400 covers most cases; for a wrong Sec-WebSocket-Version, RFC 6455 asks
+// for 426 with a Sec-WebSocket-Version: 13 header, which this doesn't send
+// for you, since it isn't an ordinary error the caller would otherwise
+// think to add).
+pub new function handshake_accept(req: Request) -> Option<string> {
+    if !same_ignoring_case(req.header("Upgrade"), "websocket") { return None }
+    if !has_token_ci(req.header("Connection"), "upgrade") { return None }
+    if req.header("Sec-WebSocket-Version") != "13" { return None }
+    let key = req.header("Sec-WebSocket-Key")
+    if key.len == 0 { return None }
+    var combined = string(key)
+    combined.append(WS_GUID)
+    let digest = sha1(combined.view())
+    return Some(base64_encode(digest))
+}
+
+// Whether `header` (a comma-separated list, as Connection's value can be)
+// contains `token`, case-insensitively, ignoring surrounding whitespace
+// around each comma-separated piece.
+new function has_token_ci(header: str, token: str) -> bool {
+    var start: uint = 0
+    while start <= header.len {
+        var end = start
+        while end < header.len && header[end] != u8(',') { end += 1 }
+        var part = slice(header, start, end)
+        var p0: uint = 0
+        while p0 < part.len && part[p0] == u8(' ') { p0 += 1 }
+        var p1 = part.len
+        while p1 > p0 && part[p1 - 1] == u8(' ') { p1 -= 1 }
+        if same_ignoring_case(slice(part, p0, p1), token) { return true }
+        start = end + 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- SHA-1 (RFC 3174)
+//
+// Only used for the handshake above (a WebSocket key plus a fixed GUID,
+// a few dozen bytes, once per connection) — not performance-sensitive, and
+// not meant for anything beyond that: SHA-1 is broken for anything that
+// needs collision resistance. It's what RFC 6455 specifies, not a choice.
+
+// SHA-1's 32-bit words, done in uint (64-bit) with explicit masking after
+// anything that can carry past bit 31, rather than in u32 relying on that
+// type's add wrapping on overflow the way C's uint32_t would — Hydrogen's
+// checked arithmetic traps on that instead, and there's no wrapping_add for
+// u32 (only for uint). Every sum here is at most a handful of 32-bit values
+// added together, nowhere near uint's own 64-bit range, so plain `+` on
+// uint never itself overflows; MASK32 is what keeps each *word* 32-bit, the
+// same job C's uint32_t would do implicitly.
+const MASK32: uint = 0xFFFFFFFF
+
+new function rotl32(x: uint, n: uint) -> uint {
+    return ((x << n) | (x >> (uint(32) - n))) & MASK32
+}
+
+new function sha1(msg: str) -> string {
+    var h0: uint = 0x67452301
+    var h1: uint = 0xEFCDAB89
+    var h2: uint = 0x98BADCFE
+    var h3: uint = 0x10325476
+    var h4: uint = 0xC3D2E1F0
+
+    var padded = List<u8>()
+    for i in 0..msg.len { padded.push(msg[i]) }
+    padded.push(u8(0x80))
+    while (int(padded.len()) % 64) != 56 { padded.push(0) }
+    let bit_len = u64(msg.len) * u64(8)
+    for i in 0..8 {
+        let shift = u64((7 - i) * 8)
+        padded.push(u8((bit_len >> shift) & u64(0xFF)))
+    }
+
+    var block: uint = 0
+    while block < padded.len() {
+        var w: [uint; 80] = [0]
+        for t in 0..16 {
+            let b0 = uint(padded.at(block + uint(t * 4))[0])
+            let b1 = uint(padded.at(block + uint(t * 4 + 1))[0])
+            let b2 = uint(padded.at(block + uint(t * 4 + 2))[0])
+            let b3 = uint(padded.at(block + uint(t * 4 + 3))[0])
+            w[t] = (b0 << uint(24)) | (b1 << uint(16)) | (b2 << uint(8)) | b3
+        }
+        for t in 16..80 {
+            w[t] = rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], uint(1))
+        }
+        var a = h0
+        var b = h1
+        var c = h2
+        var d = h3
+        var e = h4
+        for t in 0..80 {
+            var f: uint = 0
+            var k: uint = 0
+            if t < 20 {
+                f = (b & c) | ((~b) & MASK32 & d)
+                k = 0x5A827999
+            } else if t < 40 {
+                f = b ^ c ^ d
+                k = 0x6ED9EBA1
+            } else if t < 60 {
+                f = (b & c) | (b & d) | (c & d)
+                k = 0x8F1BBCDC
+            } else {
+                f = b ^ c ^ d
+                k = 0xCA62C1D6
+            }
+            let temp = (rotl32(a, uint(5)) + f + e + k + w[t]) & MASK32
+            e = d
+            d = c
+            c = rotl32(b, uint(30))
+            b = a
+            a = temp
+        }
+        h0 = (h0 + a) & MASK32
+        h1 = (h1 + b) & MASK32
+        h2 = (h2 + c) & MASK32
+        h3 = (h3 + d) & MASK32
+        h4 = (h4 + e) & MASK32
+        block += 64
+    }
+
+    var out = List<u8>()
+    push_be32(out, h0)
+    push_be32(out, h1)
+    push_be32(out, h2)
+    push_be32(out, h3)
+    push_be32(out, h4)
+    var s = string("")
+    for i in 0..int(out.len()) { append_byte(s, out.at(uint(i))[0]) }
+    return s
+}
+
+new function push_be32(out: var List<u8>, v: uint) {
+    out.push(u8((v >> uint(24)) & uint(0xFF)))
+    out.push(u8((v >> uint(16)) & uint(0xFF)))
+    out.push(u8((v >> uint(8)) & uint(0xFF)))
+    out.push(u8(v & uint(0xFF)))
+}
+
+// ---------------------------------------------------------------- base64
+
+const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+new function base64_encode(data: str) -> string {
+    var out = string("")
+    var i: uint = 0
+    while i + 3 <= data.len {
+        let n = (uint(data[i]) << 16) | (uint(data[i + 1]) << 8) | uint(data[i + 2])
+        out.append(slice(B64_ALPHABET, (n >> 18) & 63, ((n >> 18) & 63) + 1))
+        out.append(slice(B64_ALPHABET, (n >> 12) & 63, ((n >> 12) & 63) + 1))
+        out.append(slice(B64_ALPHABET, (n >> 6) & 63, ((n >> 6) & 63) + 1))
+        out.append(slice(B64_ALPHABET, n & 63, (n & 63) + 1))
+        i += 3
+    }
+    let left = data.len - i
+    if left == 1 {
+        let n = uint(data[i]) << 16
+        out.append(slice(B64_ALPHABET, (n >> 18) & 63, ((n >> 18) & 63) + 1))
+        out.append(slice(B64_ALPHABET, (n >> 12) & 63, ((n >> 12) & 63) + 1))
+        out.append("==")
+    } else if left == 2 {
+        let n = (uint(data[i]) << 16) | (uint(data[i + 1]) << 8)
+        out.append(slice(B64_ALPHABET, (n >> 18) & 63, ((n >> 18) & 63) + 1))
+        out.append(slice(B64_ALPHABET, (n >> 12) & 63, ((n >> 12) & 63) + 1))
+        out.append(slice(B64_ALPHABET, (n >> 6) & 63, ((n >> 6) & 63) + 1))
+        out.append("=")
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- frames
+
+pub const WS_TEXT = 0
+pub const WS_BINARY = 1
+pub const WS_CLOSE = 2
+
+pub new type WsMessage {
+    pub kind: int     // WS_TEXT, WS_BINARY, or WS_CLOSE
+    pub data: string  // the message (possibly reassembled from several frames); "" for WS_CLOSE
+}
+
+const OPCODE_CONTINUATION = 0
+const OPCODE_TEXT = 1
+const OPCODE_BINARY = 2
+const OPCODE_CLOSE = 8
+const OPCODE_PING = 9
+const OPCODE_PONG = 10
+
+// How many bytes one WebSocket message may add up to across all of its
+// frames, mirroring the core's MAX_BODY_BYTES for an HTTP request body —
+// same reasoning: an unbounded message (or an unbounded run of fragments)
+// would let a connection grow memory without limit.
+pub const MAX_MESSAGE_BYTES = 16777216
+
+// Reads exactly n bytes from fd (looping over partial reads), or None if
+// the connection closes, errors, or times out (see sock_recv_timeout)
+// before n bytes arrive.
+new function read_exact(fd: int, n: int) -> Option<string> {
+    var out = string("")
+    var buf: [u8; 4096] = [0]
+    while int(out.len()) < n {
+        var want = n - int(out.len())
+        if want > 4096 { want = 4096 }
+        let got = sock_recv(fd, ptr<u8>(&buf[0]), want)
+        if got <= 0 { return None }
+        out.append(str(ptr<u8>(&buf[0]), uint(got)))
+    }
+    return Some(out)
+}
+
+new type RawFrame {
+    fin: bool
+    opcode: int
+    payload: string
+}
+
+// Reads one frame (RFC 6455 §5.2) from fd. A client frame must be masked —
+// an unmasked one is a protocol violation, not something to leniently
+// accept, so this returns None for it the same as any other malformed
+// frame; the caller should close the connection.
+new function read_frame(fd: int) -> Option<RawFrame> {
+    match read_exact(fd, 2) {
+        None => { return None }
+        Some(hdr2) => {
+            let b0 = hdr2[0]
+            let b1 = hdr2[1]
+            let fin = (b0 & u8(0x80)) != 0
+            let opcode = int(b0 & u8(0x0F))
+            let masked = (b1 & u8(0x80)) != 0
+            if !masked { return None }
+            var len = u64(b1 & u8(0x7F))
+            if len == u64(126) {
+                match read_exact(fd, 2) {
+                    None => { return None }
+                    Some(ext) => { len = (u64(ext[0]) << u64(8)) | u64(ext[1]) }
+                }
+            } else if len == u64(127) {
+                match read_exact(fd, 8) {
+                    None => { return None }
+                    Some(ext) => {
+                        len = u64(0)
+                        for i in 0..8 { len = (len << u64(8)) | u64(ext.view()[uint(i)]) }
+                    }
+                }
+            }
+            if len > u64(MAX_MESSAGE_BYTES) { return None }
+            match read_exact(fd, 4) {
+                None => { return None }
+                Some(mask) => {
+                    match read_exact(fd, int(len)) {
+                        None => { return None }
+                        Some(raw) => {
+                            var payload = string("")
+                            var one: [u8; 1] = [0]
+                            let raw_view = raw.view()
+                            let mask_view = mask.view()
+                            for i in 0..int(raw.len()) {
+                                let mb = mask_view[uint(i) % uint(4)]
+                                one[0] = u8(raw_view[uint(i)] ^ mb)
+                                payload.append(str(ptr<u8>(&one[0]), 1))
+                            }
+                            return Some(RawFrame(fin, opcode, payload))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Reads one complete message, reassembling continuation frames (RFC 6455
+// §5.4) and replying to a ping with a pong internally (the caller never
+// sees pings/pongs — only WS_TEXT, WS_BINARY or WS_CLOSE). None if the
+// connection closes, errors, times out, or sends a malformed/unmasked
+// frame, or a message whose total size exceeds MAX_MESSAGE_BYTES —
+// the caller should close the connection in every one of those cases, not
+// try to tell them apart and recover.
+pub new function read_message(fd: int) -> Option<WsMessage> {
+    while true {
+        match read_frame(fd) {
+            None => { return None }
+            Some(first) => {
+                if first.opcode == OPCODE_PING {
+                    send_raw(fd, OPCODE_PONG, first.payload.view())
+                } else if first.opcode == OPCODE_PONG {
+                    // ignored
+                } else if first.opcode == OPCODE_CLOSE {
+                    send_raw(fd, OPCODE_CLOSE, "")
+                    return Some(WsMessage(WS_CLOSE, string("")))
+                } else if first.opcode == OPCODE_TEXT || first.opcode == OPCODE_BINARY {
+                    var kind = WS_TEXT
+                    if first.opcode == OPCODE_BINARY { kind = WS_BINARY }
+                    var data = first.payload.copy()
+                    var fin = first.fin
+                    while !fin {
+                        match read_frame(fd) {
+                            None => { return None }
+                            Some(next) => {
+                                if next.opcode != OPCODE_CONTINUATION { return None }
+                                if data.len() + next.payload.len() > uint(MAX_MESSAGE_BYTES) { return None }
+                                data.append(next.payload.view())
+                                fin = next.fin
+                            }
+                        }
+                    }
+                    return Some(WsMessage(kind, data))
+                } else {
+                    return None // an unknown opcode: not something to guess at
+                }
+            }
+        }
+    }
+    return None
+}
+
+new function send_raw(fd: int, opcode: int, payload: str) {
+    var out = buffer_new()
+    append_byte(out, u8(0x80 | opcode)) // FIN=1, no extensions, this opcode
+    let n = payload.len
+    if n < uint(126) {
+        append_byte(out, u8(n))
+    } else if n < uint(65536) {
+        append_byte(out, u8(126))
+        append_byte(out, u8((n >> uint(8)) & uint(255)))
+        append_byte(out, u8(n & uint(255)))
+    } else {
+        append_byte(out, u8(127))
+        for i in 0..8 {
+            let shift = uint((7 - i) * 8)
+            append_byte(out, u8((n >> shift) & uint(255)))
+        }
+    }
+    // The server never masks its own frames (RFC 6455 §5.1: only client-to-
+    // server frames are masked).
+    out.append(payload)
+    sock_send(fd, out.view().data, int(out.view().len))
+}
+
+new function buffer_new() -> string { return string("") }
+
+new function append_byte(s: var string, b: u8) {
+    var one: [u8; 1] = [0]
+    one[0] = b
+    s.append(str(ptr<u8>(&one[0]), 1))
+}
+
+pub new function send_text(fd: int, text: str) { send_raw(fd, OPCODE_TEXT, text) }
+pub new function send_binary(fd: int, data: str) { send_raw(fd, OPCODE_BINARY, data) }
+pub new function send_ping(fd: int, payload: str) { send_raw(fd, OPCODE_PING, payload) }
+// Sends a close frame. Doesn't close the fd itself — call sock_close(fd)
+// once you're done (after reading the peer's own close, if you want a
+// clean close handshake, or immediately if you'd rather not wait).
+pub new function send_close(fd: int) { send_raw(fd, OPCODE_CLOSE, "") }

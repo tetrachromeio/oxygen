@@ -1,0 +1,5 @@
+[project]
+name = "ws"
+
+[dependencies]
+Oxygen = { path = "../.." }
