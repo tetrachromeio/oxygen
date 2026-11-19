@@ -4,6 +4,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-19 — `Oxygen.Static`
+
+From [#6](https://github.com/tetrachromeio/oxygen/issues/6), part of the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Added
+
+- **`Oxygen.Static`**, a new opt-in submodule: `serve_static(root, req,
+  res) -> bool`, serving a directory with path-traversal protection
+  (canonicalizing both `root` and the resolved candidate with the hydrogen
+  repo's `real_path()`, which resolves `.`, `..` and symlinks, then
+  checking the candidate is actually inside `root`), `ETag`/`Last-Modified`
+  caching (`304` on a match), `HEAD`, and single-range `Range` support
+  (`206`/`416`; multiple ranges fall back to the whole file as `200`, a
+  compliant response per RFC 9110 §14.2 to a request this doesn't support
+  in that form).
+- Two small, justified core additions this needed: `Elemental.File.file_mtime()`
+  (hydrogen repo) and `Elemental.Net.http_date_at()` (hydrogen repo, for
+  formatting an arbitrary timestamp — `Last-Modified` needs the *file's*
+  mtime, not now).
+
+Verified in `examples/static` (19 cases, all passing) against real fixture
+files, including one path-traversal case per the issue's explicit call for
+a non-optional test suite there: plain `..`, encoded `..`, a null byte, and
+**a real symlink inside the served root pointing outside it** — all
+rejected. Also: a directory isn't served as a file, `ETag`/`Last-Modified`
+present and both conditional-request paths (`If-None-Match`,
+`If-Modified-Since`) return `304`, all four `Range` forms (`start-end`,
+`start-`, `-suffix`, out-of-bounds → `416`), the multiple-ranges fallback,
+and `HEAD` returning headers with no body.
+
 ## 2026-11-19 — idle/header timeouts, graceful shutdown, `match_prefix`
 
 From [#1](https://github.com/tetrachromeio/oxygen/issues/1).

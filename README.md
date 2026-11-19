@@ -161,6 +161,50 @@ connection that was simply sitting idle at the time (not actively mid-request)
 drains via the same idle timeout below, rather than being cut off early —
 within a bound, not held open indefinitely either.
 
+## Modules
+
+Opt-in layers on top of the core, each its own submodule — `use Oxygen` alone
+never pulls one in, so a service that doesn't need it pays nothing for it.
+
+### `Oxygen.Static`
+
+Serves a directory of static files, with path-traversal protection,
+`ETag`/`Last-Modified` caching, `HEAD`, and `Range`:
+
+```
+use Oxygen
+use Oxygen.Static
+
+new function handle(req: Request, res: Response) {
+    if serve_static("/var/www/public", req, res) { return }
+    res.not_found()
+}
+```
+
+- `serve_static(root, req, res) -> bool`: `true` if it served the request
+  (including an error status for something that exists but couldn't be
+  read) — the caller should stop, not fall through to its own 404. `false`
+  if there's nothing to serve here (wrong method, no such file, or path
+  traversal) — the caller continues as normal.
+- **Path traversal is the load-bearing part of this module.** Both `root`
+  and the resolved candidate file are canonicalized (`.`, `..`, and
+  symbolic links resolved) before checking the candidate is actually
+  inside `root` — not just string-prefixed by it. This catches a plain
+  `..`, an encoded one (`req.decoded_path()` already percent-decodes it),
+  and a symlink inside `root` pointing outside it. A null byte in the
+  decoded path is rejected outright, before any filesystem call.
+- `ETag` (from the file's size and mtime) and `Last-Modified`; a matching
+  `If-None-Match` or `If-Modified-Since` gets `304` with no body.
+- `Range: bytes=...` (a single range; a start, an end, or both, or a
+  suffix count) gets `206 Partial Content`; an out-of-bounds range gets
+  `416`; more than one range in the header falls back to the whole file as
+  a plain `200` (multiple ranges would need a `multipart/byteranges`
+  response, which isn't implemented) — a compliant response to a `Range`
+  this can't satisfy in the form asked, per RFC 9110 §14.2.
+- `HEAD` reuses the core's existing head-only handling (`req.get()` already
+  answers `HEAD` the same way as `GET`, without the body) — nothing special
+  needed here.
+
 ## Limits (for now)
 
 - No TLS: put Oxygen behind a proxy for HTTPS.

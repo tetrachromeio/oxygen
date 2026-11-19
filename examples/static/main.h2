@@ -1,0 +1,210 @@
+// Oxygen.Static's self-test, and a small demo of serving a directory.
+// Run from examples/static (its fixtures/ is relative to the cwd).
+use Elemental
+use Elemental.Net
+use Elemental.System
+use Elemental.Thread
+use Oxygen
+use Oxygen.Static
+
+new function handle(req: Request, res: Response) {
+    if serve_static("fixtures", req, res) { return }
+    res.not_found()
+}
+
+new function run_server(port: int) -> int { return serve("127.0.0.1", port, 1, handle) }
+
+new function check(port: int, title: str, request: str, want_status: int, want_body: str) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            var ok = starts_with(text, "HTTP/1.1 {want_status}")
+            if want_body.len > 0 && !ends_with(text, want_body) { ok = false }
+            if ok { print("PASS {title}") }
+            else {
+                print("FAIL {title}: want status {want_status}, body ending with: {want_body}")
+                print("  got:")
+                for line in split(text, "\r\n") { print("    {line}") }
+            }
+            return ok
+        }
+    }
+}
+
+new function check_headers(port: int, title: str, request: str, want_status: int, substrings: List<str>) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            var ok = starts_with(text, "HTTP/1.1 {want_status}")
+            for i in 0..int(substrings.len()) {
+                let want = substrings.at(uint(i))
+                var found = false
+                match find(text, want[0]) {
+                    Some(_) => { found = true }
+                    None => {}
+                }
+                if !found { ok = false }
+            }
+            if ok { print("PASS {title}") }
+            else {
+                print("FAIL {title}:")
+                for line in split(text, "\r\n") { print("    {line}") }
+            }
+            return ok
+        }
+    }
+}
+
+new function main() -> int {
+    var port = 0
+    match listen("127.0.0.1", 0) {
+        Err(e) => {
+            print("no free port: {e}")
+            return 1
+        }
+        Ok(l) => { port = l.port }
+    }
+    let server = spawn(port, run_server)
+    var up = false
+    for attempt in 0..200 {
+        match connect("127.0.0.1", port) {
+            Err(e) => { sleep(0.01) }
+            Ok(c) => { up = true; break }
+        }
+    }
+    if !up {
+        print("server didn't start")
+        exit_now(1)
+    }
+
+    var failures = 0
+    if !check(port, "serves a file", "GET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "Hello, static world!") { failures += 1 }
+    if !check(port, "serves a nested file", "GET /sub/nested.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "nested file") { failures += 1 }
+    if !check(port, "missing file -> false -> caller's 404", "GET /nope.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "Not Found") { failures += 1 }
+    if !check(port, "a directory isn't served as a file", "GET /sub HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "Not Found") { failures += 1 }
+
+    // Path traversal.
+    if !check(port, "plain .. traversal blocked", "GET /../outside/secret.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "") { failures += 1 }
+    if !check(port, "encoded .. traversal blocked", "GET /%2e%2e/outside/secret.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "") { failures += 1 }
+    if !check(port, "null byte in path blocked", "GET /hello.txt%00.png HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "") { failures += 1 }
+    if !check(port, "symlink escaping root blocked", "GET /escape.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "") { failures += 1 }
+
+    // Caching.
+    var h1 = List<str>()
+    h1.push("ETag:")
+    h1.push("Last-Modified:")
+    h1.push("Accept-Ranges: bytes")
+    if !check_headers(port, "ETag/Last-Modified/Accept-Ranges present", "GET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 200, h1) { failures += 1 }
+
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("FAIL conditional request setup: {e}"); failures += 1 }
+        Ok(c) => {
+            c.write("GET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n")
+            var first = string("")
+            c.read_all(first)
+            var etag = ""
+            for line in split(first.view(), "\r\n") {
+                if starts_with(line, "ETag: ") { etag = slice(line, 6, line.len) }
+            }
+            if etag.len == 0 {
+                print("FAIL conditional request: no ETag in first response")
+                failures += 1
+            } else {
+                match connect("127.0.0.1", port) {
+                    Err(e) => { print("FAIL conditional request: {e}"); failures += 1 }
+                    Ok(c2) => {
+                        c2.write("GET /hello.txt HTTP/1.1\r\nIf-None-Match: " + etag + "\r\nConnection: close\r\n\r\n")
+                        var second = string("")
+                        c2.read_all(second)
+                        if starts_with(second.view(), "HTTP/1.1 304") { print("PASS If-None-Match -> 304") }
+                        else {
+                            print("FAIL If-None-Match: want 304, got:")
+                            for line in split(second.view(), "\r\n") { print("    {line}") }
+                            failures += 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("FAIL If-Modified-Since setup: {e}"); failures += 1 }
+        Ok(c) => {
+            c.write("GET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n")
+            var first = string("")
+            c.read_all(first)
+            var lm = ""
+            for line in split(first.view(), "\r\n") {
+                if starts_with(line, "Last-Modified: ") { lm = slice(line, 15, line.len) }
+            }
+            if lm.len == 0 {
+                print("FAIL If-Modified-Since: no Last-Modified in first response")
+                failures += 1
+            } else {
+                match connect("127.0.0.1", port) {
+                    Err(e) => { print("FAIL If-Modified-Since: {e}"); failures += 1 }
+                    Ok(c2) => {
+                        c2.write("GET /hello.txt HTTP/1.1\r\nIf-Modified-Since: " + lm + "\r\nConnection: close\r\n\r\n")
+                        var second = string("")
+                        c2.read_all(second)
+                        if starts_with(second.view(), "HTTP/1.1 304") { print("PASS If-Modified-Since -> 304") }
+                        else {
+                            print("FAIL If-Modified-Since: want 304, got:")
+                            for line in split(second.view(), "\r\n") { print("    {line}") }
+                            failures += 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Range.
+    var h2 = List<str>()
+    h2.push("Content-Range: bytes 0-4/20")
+    if !check_headers(port, "range: first 5 bytes", "GET /hello.txt HTTP/1.1\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", 206, h2) { failures += 1 }
+    if !check(port, "range: first 5 bytes, body", "GET /hello.txt HTTP/1.1\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", 206, "Hello") { failures += 1 }
+    if !check(port, "range: suffix (last 6 bytes)", "GET /hello.txt HTTP/1.1\r\nRange: bytes=-6\r\nConnection: close\r\n\r\n", 206, "world!") { failures += 1 }
+    if !check(port, "range: open-ended (from byte 7)", "GET /hello.txt HTTP/1.1\r\nRange: bytes=7-\r\nConnection: close\r\n\r\n", 206, "static world!") { failures += 1 }
+    if !check(port, "range: unsatisfiable -> 416", "GET /hello.txt HTTP/1.1\r\nRange: bytes=1000-2000\r\nConnection: close\r\n\r\n", 416, "") { failures += 1 }
+    if !check(port, "no Range header -> plain 200", "GET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "Hello, static world!") { failures += 1 }
+    if !check(port, "range: multiple ranges -> falls back to whole file", "GET /hello.txt HTTP/1.1\r\nRange: bytes=0-4,10-14\r\nConnection: close\r\n\r\n", 200, "Hello, static world!") { failures += 1 }
+
+    // HEAD.
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("FAIL HEAD: {e}"); failures += 1 }
+        Ok(c) => {
+            c.write("HEAD /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n")
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            if starts_with(text, "HTTP/1.1 200") && ends_with(text, "\r\n\r\n") {
+                print("PASS HEAD: headers only, no body")
+            } else {
+                print("FAIL HEAD:")
+                for line in split(text, "\r\n") { print("    {line}") }
+                failures += 1
+            }
+        }
+    }
+
+    print("")
+    if failures == 0 { print("all passed") } else { print("{failures} failed") }
+    exit_now(failures)
+    return 0
+}

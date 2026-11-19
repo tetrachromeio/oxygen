@@ -1,0 +1,213 @@
+// Oxygen.Static: serving a directory of static files safely, with caching
+// and Range support, as an opt-in submodule.
+//
+//     use Oxygen
+//     use Oxygen.Static
+//
+//     new function handle(req: Request, res: Response) {
+//         if serve_static("/var/www/public", req, res) { return }
+//         res.not_found()
+//     }
+//
+// The path-traversal protection below is the load-bearing part of this
+// module — read it before changing anything else here.
+use Elemental
+use Elemental.File
+use Elemental.Net
+use Oxygen
+
+new function has_null_byte(s: str) -> bool {
+    for i in 0..s.len { if s[i] == 0 { return true } }
+    return false
+}
+
+// Is `candidate` (a canonical, already-resolved path) `root` itself, or
+// inside it? String-prefix matching alone isn't enough ("/var/www2" starts
+// with "/var/www" as a string but isn't inside it) — the byte right after
+// the prefix must be a path separator, or there must be nothing after it at
+// all.
+new function within_root(root: str, candidate: str) -> bool {
+    if candidate == root { return true }
+    if !starts_with(candidate, root) { return false }
+    return candidate[root.len] == u8('/')
+}
+
+// Serves `path` (one file, already resolved and confirmed inside some root)
+// to `req`/`res`. Not exported directly — go through serve_static, which
+// does the traversal check first; calling this with an unchecked path is
+// exactly the mistake that check exists to prevent.
+new function serve_file(path: str, req: Request, res: Response) {
+    match map_file(path) {
+        Err(e) => {
+            res.status(500)
+        }
+        Ok(mapped) => {
+            let mtime = unwrap_or(file_mtime(path), 0)
+            var date_buf: [u8; 29] = [0]
+            http_date_at(ptr<u8>(&date_buf[0]), mtime)
+            let last_modified = str(ptr<u8>(&date_buf[0]), 29)
+            let etag = "\"{mapped.len}-{mtime}\""
+            let full = mapped.text()
+            let ctype = mime_type(path)
+
+            // Conditional requests: If-None-Match wins over If-Modified-Since
+            // if both are present, per RFC 9110 §13.1.1.
+            let inm = req.header("If-None-Match")
+            let ims = req.header("If-Modified-Since")
+            if inm.len > 0 {
+                if inm == etag.view() {
+                    res.header("ETag", etag.view())
+                    res.status(304)
+                    return
+                }
+            } else if ims.len > 0 && ims == last_modified {
+                res.header("ETag", etag.view())
+                res.status(304)
+                return
+            }
+
+            let range_header = req.header("Range")
+            if range_header.len == 0 {
+                res.header("ETag", etag.view())
+                res.header("Last-Modified", last_modified)
+                res.header("Accept-Ranges", "bytes")
+                res.send(200, ctype, full)
+                return
+            }
+            match parse_range(range_header, int(full.len)) {
+                None => {
+                    res.header("Content-Range", "bytes */{full.len}")
+                    res.status(416)
+                }
+                Some(r) => {
+                    if r.multiple {
+                        // Multiple ranges in one request aren't supported
+                        // (that needs a multipart/byteranges response); per
+                        // RFC 9110 §14.2, falling back to the whole file is
+                        // a compliant response to a Range we can't satisfy
+                        // in the form asked.
+                        res.header("ETag", etag.view())
+                        res.send(200, ctype, full)
+                    } else {
+                        res.header("ETag", etag.view())
+                        res.header("Last-Modified", last_modified)
+                        res.header("Accept-Ranges", "bytes")
+                        res.header("Content-Range", "bytes {r.start}-{r.end}/{full.len}")
+                        res.send(206, ctype, slice(full, uint(r.start), uint(r.end + 1)))
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Tries to serve `req` from under `root`. True if it did (including an
+// error response for something that exists but couldn't be read) — the
+// caller should stop, not fall through to its own 404. False if there's
+// nothing here to serve (wrong method, no such file, or path traversal),
+// meaning the caller should continue to whatever else it does for an
+// unmatched request.
+//
+// Path traversal protection: real_path() resolves `.`, `..` and symbolic
+// links to an absolute, canonical path — on both `root` and the resolved
+// candidate file — and within_root() then checks the candidate is actually
+// inside root, not just string-prefixed by it. This catches plain `..`
+// (req.decoded_path() already percent-decoded anything encoded), a symlink
+// inside root pointing outside it, and anything else real_path() would
+// resolve differently than a naive string join would suggest. A null byte
+// in the decoded path is rejected outright, before any filesystem call:
+// passing one through to a C path string would silently truncate it.
+pub new function serve_static(root: str, req: Request, res: Response) -> bool {
+    if req.method != "GET" && req.method != "HEAD" { return false }
+    let decoded = req.decoded_path()
+    if has_null_byte(decoded.view()) { return false }
+    match real_path(root) {
+        None => { return false }
+        Some(root_real) => {
+            let candidate = string(root) + decoded.view()
+            match real_path(candidate.view()) {
+                None => { return false }
+                Some(file_real) => {
+                    if !within_root(root_real.view(), file_real.view()) { return false }
+                    if !is_file(file_real.view()) { return false }
+                    serve_file(file_real.view(), req, res)
+                    return true
+                }
+            }
+        }
+    }
+}
+
+new type RangeResult {
+    start: int
+    end: int       // inclusive
+    multiple: bool // more than one range was asked for (unsupported: caller falls back to the whole file)
+}
+
+// Parses a Range header ("bytes=START-END", "bytes=START-", "bytes=-SUFFIX")
+// against a file of `size` bytes. None for a syntactically invalid or
+// genuinely unsatisfiable range (the caller sends 416 for that) — this
+// never guesses at a malformed Range, same policy as the core's own HTTP
+// parsing.
+new function parse_range(header: str, size: int) -> Option<RangeResult> {
+    if !starts_with(header, "bytes=") { return None }
+    let spec = slice(header, 6, header.len)
+    match find(spec, ",") {
+        Some(_) => { return Some(RangeResult(0, 0, true)) }
+        None => {}
+    }
+    var dash: uint = 0
+    while dash < spec.len && spec[dash] != u8('-') { dash += 1 }
+    if dash == spec.len { return None }
+    let start_s = slice(spec, 0, dash)
+    let end_s = slice(spec, dash + 1, spec.len)
+    if start_s.len == 0 {
+        if end_s.len == 0 { return None }
+        match parse_int(end_s) {
+            None => { return None }
+            Some(suffix) => {
+                if suffix <= 0 { return None }
+                var start = size - suffix
+                if start < 0 { start = 0 }
+                if size == 0 { return None }
+                return Some(RangeResult(start, size - 1, false))
+            }
+        }
+    }
+    match parse_int(start_s) {
+        None => { return None }
+        Some(start) => {
+            if start < 0 || start >= size { return None }
+            var end = size - 1
+            if end_s.len > 0 {
+                match parse_int(end_s) {
+                    None => { return None }
+                    Some(e) => {
+                        end = e
+                        if end >= size { end = size - 1 }
+                        if end < start { return None }
+                    }
+                }
+            }
+            return Some(RangeResult(start, end, false))
+        }
+    }
+}
+
+new function mime_type(path: str) -> str {
+    if ends_with(path, ".html") || ends_with(path, ".htm") { return "text/html; charset=utf-8" }
+    if ends_with(path, ".css") { return "text/css; charset=utf-8" }
+    if ends_with(path, ".js") { return "text/javascript; charset=utf-8" }
+    if ends_with(path, ".json") { return "application/json" }
+    if ends_with(path, ".png") { return "image/png" }
+    if ends_with(path, ".jpg") || ends_with(path, ".jpeg") { return "image/jpeg" }
+    if ends_with(path, ".gif") { return "image/gif" }
+    if ends_with(path, ".svg") { return "image/svg+xml" }
+    if ends_with(path, ".ico") { return "image/x-icon" }
+    if ends_with(path, ".txt") { return "text/plain; charset=utf-8" }
+    if ends_with(path, ".pdf") { return "application/pdf" }
+    if ends_with(path, ".woff2") { return "font/woff2" }
+    if ends_with(path, ".woff") { return "font/woff" }
+    if ends_with(path, ".wasm") { return "application/wasm" }
+    return "application/octet-stream"
+}
