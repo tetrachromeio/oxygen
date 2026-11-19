@@ -134,6 +134,7 @@ this repo yet.
 | `res.not_found()` `res.status(code)` | status with its reason as the body |
 | `res.header(name, value)` | extra header (before sending); ignored if `name`/`value` contain CR or LF, or if the response is already sent |
 | `res.close()` | close the connection after this response |
+| `res.status_code()` | the status this response was sent with, or `0` if it hasn't been yet |
 | `res.begin_events()`, `res.event(data)`, `res.end_events()` | Server-Sent Events, each event sent at once; `event` returns false once the client has gone |
 
 A handler that doesn't answer gets a 500. Requests are answered in order;
@@ -160,6 +161,62 @@ request finish); `serve`/`serve_with` return once all of them have. A
 connection that was simply sitting idle at the time (not actively mid-request)
 drains via the same idle timeout below, rather than being cut off early —
 within a bound, not held open indefinitely either.
+
+## Modules
+
+Opt-in layers on top of the core, each its own submodule — `use Oxygen` alone
+never pulls one in, so a service that doesn't need it pays nothing for it.
+
+### `Oxygen.Middleware`
+
+Cross-cutting concerns (CORS, security headers, request IDs, access
+logging) as plain functions you call from your own handler, not
+`Handler`-wrapping decorators — Oxygen's core `Handler` can't capture
+variables, so there's no closure to wrap one in:
+
+```
+use Oxygen
+use Oxygen.Middleware
+
+new function handle(req: Request, res: Response) {
+    if cors(default_cors(), req, res) { return }   // true: preflight, already answered
+    add_security_headers(default_security_headers(), res)
+    let id = request_id(req)
+    res.header("X-Request-Id", id.view())
+    let t0 = now()
+
+    if req.get("/") { res.text("Hello, World!") }
+    else { res.not_found() }
+
+    log_access(req, res, id.view(), t0)
+}
+```
+
+- `cors(config, req, res) -> bool`: adds CORS headers; answers an `OPTIONS`
+  preflight itself (204) and returns `true`, meaning the caller should
+  return right away rather than continue to its real handler.
+  `allow_credentials` with a wildcard `allowed_origin` is invalid per the
+  Fetch spec, so that combination sends no `Access-Control-Allow-Credentials`
+  rather than a response no browser would honor anyway.
+- `add_security_headers(config, res)`: `X-Content-Type-Options: nosniff`
+  always; configurable `X-Frame-Options`, `Referrer-Policy`,
+  `Content-Security-Policy`, `Strict-Transport-Security`.
+- `request_id(req) -> string`: the incoming `X-Request-Id` if there is one,
+  otherwise a freshly generated one (not a security token — just enough to
+  correlate one request's own log lines).
+- `log_access(req, res, id, started_at)`: one line with method, path,
+  status, the request id, and latency — call it after your handler answers,
+  so `res.status_code()` (new on `Response`, for this) is the real one.
+
+**Not here yet:** trusted-proxy header extraction (`Forwarded`/
+`X-Forwarded-For`), since doing it safely means only honoring those headers
+when the immediate TCP peer is itself a trusted proxy, and the core doesn't
+expose a connection's peer address to a handler yet. Shipping it without
+that would mean trusting every client's `Forwarded` header unconditionally —
+exactly the vulnerability this feature exists to prevent — so it's deferred
+until peer addresses are exposed
+([#10](https://github.com/tetrachromeio/oxygen/issues/10)), tracked as
+[#11](https://github.com/tetrachromeio/oxygen/issues/11).
 
 ## Limits (for now)
 

@@ -1,0 +1,129 @@
+// Oxygen.Middleware: cross-cutting concerns (CORS, security headers, request
+// IDs, access logging) as plain functions you call from your own handler —
+// not Handler-wrapping decorators. Oxygen's core Handler type can't capture
+// variables (every worker thread calls the same one, with no per-call state
+// of its own — see init.h2's module doc), so there's no "wrap_cors(handler)
+// -> Handler" that could close over a config and an inner handler the way
+// the issue this was built from first sketched it. Calling each piece
+// directly, in order, from a handler you write is the shape that actually
+// fits:
+//
+//     use Oxygen
+//     use Oxygen.Middleware
+//
+//     new function handle(req: Request, res: Response) {
+//         if cors(my_cors, req, res) { return }         // true: preflight, already answered
+//         add_security_headers(my_security, res)
+//         let id = request_id(req)
+//         res.header("X-Request-Id", id.view())
+//         let t0 = now()
+//
+//         if req.get("/") { res.text("Hello, World!") }
+//         else { res.not_found() }
+//
+//         log_access(req, res, id.view(), t0)
+//     }
+//
+// Trusted-proxy header extraction (Forwarded / X-Forwarded-For) isn't here:
+// doing it safely means only honoring those headers when the immediate TCP
+// peer is itself a trusted proxy, and Oxygen's core doesn't expose a
+// connection's peer address to a handler at all yet. Implementing it without
+// that would mean either trusting every client's Forwarded header
+// unconditionally (exactly the vulnerability this is supposed to prevent) or
+// faking the check, so it's deferred until the core exposes peer addresses
+// (tetrachromeio/oxygen#10) rather than shipped half-safe — see
+// tetrachromeio/oxygen#11 for that piece.
+use Elemental
+use Elemental.Time
+use Oxygen
+
+// ---------------------------------------------------------------- CORS
+
+pub new type CorsConfig {
+    pub allowed_origin: str      // "*", or one exact origin to echo back
+    pub allowed_methods: str     // e.g. "GET, POST, PUT, DELETE, OPTIONS"
+    pub allowed_headers: str     // e.g. "Content-Type, Authorization"
+    pub allow_credentials: bool
+    pub max_age_seconds: int     // Access-Control-Max-Age; 0 omits it
+}
+
+// A permissive starting point: wildcard origin, the usual methods, no
+// credentials. Narrow it for anything that isn't a fully public API.
+pub new function default_cors() -> CorsConfig {
+    return CorsConfig("*", "GET, POST, PUT, DELETE, OPTIONS", "Content-Type, Authorization", false, 0)
+}
+
+// Adds CORS headers to `res` for `req`. Returns true if this was a preflight
+// `OPTIONS` request that's now fully answered (204) — the caller should
+// return right away, not go on to its real handler. Returns false
+// otherwise, after adding the non-preflight CORS headers; the caller
+// continues as normal.
+//
+// `allow_credentials` with a wildcard `allowed_origin` is invalid per the
+// Fetch spec (browsers reject it) — asking for both here sends no
+// `Access-Control-Allow-Credentials` at all rather than a response no
+// browser would honor anyway.
+pub new function cors(cfg: CorsConfig, req: Request, res: Response) -> bool {
+    res.header("Access-Control-Allow-Origin", cfg.allowed_origin)
+    if cfg.allow_credentials && cfg.allowed_origin != "*" {
+        res.header("Access-Control-Allow-Credentials", "true")
+    }
+    if req.method == "OPTIONS" {
+        res.header("Access-Control-Allow-Methods", cfg.allowed_methods)
+        res.header("Access-Control-Allow-Headers", cfg.allowed_headers)
+        if cfg.max_age_seconds > 0 { res.header("Access-Control-Max-Age", "{cfg.max_age_seconds}") }
+        res.status(204)
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- security headers
+
+pub new type SecurityHeadersConfig {
+    pub x_frame_options: str            // "" omits it; else e.g. "DENY", "SAMEORIGIN"
+    pub referrer_policy: str            // "" omits it
+    pub content_security_policy: str    // "" omits it
+    pub hsts_max_age_seconds: int       // 0 omits Strict-Transport-Security
+}
+
+// X-Content-Type-Options: nosniff always; DENY framing, no-referrer, no CSP,
+// no HSTS. Narrow or widen per app — HSTS in particular should only be
+// turned on once you're sure every path to this server is HTTPS (it tells
+// browsers to refuse HTTP to this host for max_age_seconds, which is not
+// reversible by serving a different header later within that window).
+pub new function default_security_headers() -> SecurityHeadersConfig {
+    return SecurityHeadersConfig("DENY", "no-referrer", "", 0)
+}
+
+pub new function add_security_headers(cfg: SecurityHeadersConfig, res: Response) {
+    res.header("X-Content-Type-Options", "nosniff")
+    if cfg.x_frame_options.len > 0 { res.header("X-Frame-Options", cfg.x_frame_options) }
+    if cfg.referrer_policy.len > 0 { res.header("Referrer-Policy", cfg.referrer_policy) }
+    if cfg.content_security_policy.len > 0 { res.header("Content-Security-Policy", cfg.content_security_policy) }
+    if cfg.hsts_max_age_seconds > 0 { res.header("Strict-Transport-Security", "max-age={cfg.hsts_max_age_seconds}") }
+}
+
+// ---------------------------------------------------------------- request IDs & access logging
+
+// The incoming X-Request-Id if the caller (or a proxy in front of this
+// server) set one, otherwise a freshly generated one. Not cryptographically
+// unique — built from the monotonic and wall clocks, which is enough to
+// correlate one request's own log lines, not a security token. An upstream
+// value is trusted as-is (not reformatted), matching how most systems that
+// propagate this header work: validate it yourself first if you're worried
+// about log injection from an untrusted caller setting it to something odd.
+pub new function request_id(req: Request) -> string {
+    let existing = req.header("X-Request-Id")
+    if existing.len > 0 { return string(existing) }
+    return string("{now()}-{unix_time()}")
+}
+
+// One line per request: method, path, status, the request id, and latency
+// in seconds. Call this once, after your handler has answered (so
+// res.status_code() is the real one) — including after end_events() for a
+// streamed response, since the status only reflects what begin_events()
+// sent (normally 200) until then anyway.
+pub new function log_access(req: Request, res: Response, id: str, started_at: float) {
+    print("{req.method} {req.path} {res.status_code()} id={id} {now() - started_at}s")
+}
