@@ -7,6 +7,9 @@ instead.
 ## 2026-11-19 — `Oxygen.Middleware`
 
 From [#4](https://github.com/tetrachromeio/oxygen/issues/4), part of the
+## 2026-11-19 — `Oxygen.Router`
+
+From [#3](https://github.com/tetrachromeio/oxygen/issues/3), part of the
 [extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
 
 ### Added
@@ -36,6 +39,30 @@ From [#4](https://github.com/tetrachromeio/oxygen/issues/4), part of the
   [#10](https://github.com/tetrachromeio/oxygen/issues/10) (exposing a
   connection's peer address on `Request` — a real core gap found while
   building this, not originally in scope).
+- **`Oxygen.Router`**, a new opt-in submodule: dynamic path params
+  (`/users/:id`), a wildcard tail (`/static/*path`), `router.group(prefix)`
+  for a prefixed sub-router, automatic `405 Method Not Allowed` with an
+  `Allow` header, and automatic `OPTIONS`. Route handlers take
+  `(Request, Response, Params)`; `Params.get(name)` returns a captured
+  segment as a zero-copy view into `req.path`.
+- Dispatches through the existing `context` mechanism
+  (`dispatch_handler` + a `Router` as context), the same way any other
+  shared app state reaches a handler.
+
+### Measured
+
+- Linear scan vs. a trie: a 50-route table (mixed literal/dynamic segments)
+  takes ~0.3us per dispatch, regardless of whether the match is the first
+  route, the last, or no match at all after scanning everything. Against the
+  ~5.5us/request budget implied by the ~180k req/s/core number above, that's
+  about 5% of it in the worst case — real, but not dominant at this scale.
+  Kept the linear scan; a trie would matter more for a route table orders of
+  magnitude larger, or traffic that's mostly 404s.
+- No heap allocation on a successful dispatch (checked by inspection — the
+  only allocation in `handle()` is on the 405/`Allow`-building path, not the
+  match-and-call path) and no RSS growth over 10,000 real requests against a
+  running server (2516KB -> 2524KB; the few KB of noise is connection/OS
+  churn, not a per-request leak).
 
 ## 2026-11-19 — idle/header timeouts, graceful shutdown, `match_prefix`
 

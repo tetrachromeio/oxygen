@@ -1,0 +1,147 @@
+// Oxygen.Router's self-test: serves on a free port in a background thread,
+// and the main thread checks it as a client over real sockets. Also usable
+// as a small demo of the router's API.   router [port]  (omit port to self-test)
+use Elemental
+use Elemental.Net
+use Elemental.System
+use Elemental.Thread
+use Oxygen
+use Oxygen.Router
+
+new function list_users(req: Request, res: Response, p: Params) { res.text("list users") }
+
+new function get_user(req: Request, res: Response, p: Params) {
+    match p.get("id") {
+        Some(id) => { res.text("user " + string(id)) }
+        None => { res.status(400) }
+    }
+}
+
+new function static_files(req: Request, res: Response, p: Params) {
+    match p.get("path") {
+        Some(rest) => { res.text("static: " + string(rest)) }
+        None => { res.text("static: (empty)") }
+    }
+}
+
+new function admin_dashboard(req: Request, res: Response, p: Params) { res.text("admin dashboard") }
+
+new function build_router() -> Router {
+    var router = Router()
+    router.get("/users", list_users)
+    router.get("/users/:id", get_user)
+    router.post("/users/:id", get_user)
+    router.get("/static/*path", static_files)
+    var admin = router.group("/admin")
+    admin.get("/dashboard", admin_dashboard)
+    return router
+}
+
+new function run_server(port: int) -> int {
+    var router = build_router()
+    return serve_with("127.0.0.1", port, 1, ptr<u8>(&router), dispatch_handler)
+}
+
+// Sends a raw request; true if the status line matches want_status and (when
+// want_body isn't empty) the reply ends with want_body.
+new function check(port: int, title: str, request: str, want_status: int, want_body: str) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            var ok = starts_with(text, "HTTP/1.1 {want_status}")
+            if want_body.len > 0 && !ends_with(text, want_body) { ok = false }
+            if ok { print("PASS {title}") }
+            else {
+                print("FAIL {title}: want status {want_status}, body ending with: {want_body}")
+                print("  got:")
+                for line in split(text, "\r\n") { print("    {line}") }
+            }
+            return ok
+        }
+    }
+}
+
+// Like check, but looks at a header's value (ending in want_value) instead of
+// the body — for Allow, where the body isn't the point.
+new function check_header(port: int, title: str, request: str, want_status: int, header_name: str, want_value: str) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            var ok = starts_with(text, "HTTP/1.1 {want_status}")
+            var found = false
+            for line in split(text, "\r\n") {
+                if starts_with(line, header_name + ": ") && ends_with(line, want_value) { found = true }
+            }
+            if ok && found { print("PASS {title}") }
+            else {
+                print("FAIL {title}: want status {want_status}, {header_name} ending with: {want_value}")
+                print("  got:")
+                for line in split(text, "\r\n") { print("    {line}") }
+            }
+            return ok && found
+        }
+    }
+}
+
+new function main() -> int {
+    let argv = args()
+    if argv.len() > 1 {
+        // Plain demo mode: just serve on the given port.
+        let port = unwrap_or(parse_int(argv[1]), 18090)
+        var router = build_router()
+        return serve_with("127.0.0.1", port, 1, ptr<u8>(&router), dispatch_handler)
+    }
+
+    var port = 0
+    match listen("127.0.0.1", 0) {
+        Err(e) => {
+            print("no free port: {e}")
+            return 1
+        }
+        Ok(l) => { port = l.port }
+    }
+    let server = spawn(port, run_server)
+    var up = false
+    for attempt in 0..200 {
+        match connect("127.0.0.1", port) {
+            Err(e) => { sleep(0.01) }
+            Ok(c) => { up = true; break }
+        }
+    }
+    if !up {
+        print("server didn't start")
+        exit_now(1)
+    }
+
+    var failures = 0
+    if !check(port, "static route", "GET /users HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "list users") { failures += 1 }
+    if !check(port, "dynamic param", "GET /users/42 HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "user 42") { failures += 1 }
+    if !check(port, "dynamic param, POST", "POST /users/42 HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "user 42") { failures += 1 }
+    if !check_header(port, "method mismatch -> 405 + Allow", "DELETE /users/42 HTTP/1.1\r\nConnection: close\r\n\r\n", 405, "Allow", "POST") { failures += 1 }
+    if !check_header(port, "automatic OPTIONS -> 204 + Allow", "OPTIONS /users/42 HTTP/1.1\r\nConnection: close\r\n\r\n", 204, "Allow", "POST") { failures += 1 }
+    if !check(port, "wildcard tail", "GET /static/js/app.js HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "static: js/app.js") { failures += 1 }
+    if !check(port, "wildcard tail, empty", "GET /static/ HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "static: ") { failures += 1 }
+    if !check(port, "route group prefix", "GET /admin/dashboard HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "admin dashboard") { failures += 1 }
+    if !check(port, "extra path segment -> no match", "GET /users/42/extra HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "") { failures += 1 }
+    if !check(port, "no route at all -> 404", "GET /nope HTTP/1.1\r\nConnection: close\r\n\r\n", 404, "") { failures += 1 }
+    if !check(port, "trailing slash is insignificant", "GET /users/ HTTP/1.1\r\nConnection: close\r\n\r\n", 200, "list users") { failures += 1 }
+
+    print("")
+    if failures == 0 { print("all passed") } else { print("{failures} failed") }
+    exit_now(failures)
+    return 0
+}

@@ -217,6 +217,46 @@ exactly the vulnerability this feature exists to prevent — so it's deferred
 until peer addresses are exposed
 ([#10](https://github.com/tetrachromeio/oxygen/issues/10)), tracked as
 [#11](https://github.com/tetrachromeio/oxygen/issues/11).
+### `Oxygen.Router`
+
+Dynamic path params (`/users/:id`), a wildcard tail (`/static/*path`),
+`router.group(prefix)` for a prefixed sub-router, automatic `405 Method Not
+Allowed` + `Allow`, and automatic `OPTIONS`:
+
+```
+use Oxygen
+use Oxygen.Router
+
+new function get_user(req: Request, res: Response, p: Params) {
+    match p.get("id") {
+        Some(id) => { res.text("user " + string(id)) }
+        None => { res.status(400) }
+    }
+}
+
+new function main() -> int {
+    var router = Router()
+    router.get("/users/:id", get_user)
+    return serve_with("127.0.0.1", 8080, 1, ptr<u8>(&router), dispatch_handler)
+}
+```
+
+Route handlers take `(Request, Response, Params)`, not plain `(Request,
+Response)` — `Params.get(name)` returns a captured segment as a zero-copy
+view into `req.path`, `Some(value)` or `None`. Register every route before
+calling `serve`/`serve_with`, not after: dispatch only reads the route table,
+but every worker thread reads it without synchronization, the same way
+`context` already works for shared app state — which is exactly what this
+uses (`req.context` is the `Router`, so bring your own app state via a field
+on your own struct that embeds a `Router`, rather than fighting over that one
+pointer).
+
+Routes are matched with a linear scan, not a trie: measured at a 50-route
+table, ~0.3us/dispatch regardless of where the match lands (first route,
+last, or no match at all) — about 5% of the ~5.5us/request budget implied by
+this README's ~180k req/s/core number, in the worst case. Real but not
+dominant at this scale; a trie would matter more for a route table orders of
+magnitude larger, or traffic that's mostly 404s.
 
 ## Limits (for now)
 

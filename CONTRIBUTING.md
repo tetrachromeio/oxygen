@@ -25,6 +25,17 @@ All of them share one namespace (a non-`pub` item in `parse.h2` is visible
 from `loop.h2`, say), so put something where a reader looking for it would
 look first, not necessarily where it's used.
 
+Higher-level, opt-in features live in their own submodule instead — a
+folder with its own `init.h2`, requiring its own explicit `use Oxygen.Whatever`
+(see the same `include` doc above, under "Finding modules") — so `use Oxygen`
+alone never pulls them in. `Router/` is the first of these (see the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2)
+for what else is planned); a new one gets its own folder, its own dedicated
+example under `examples/` doubling as its test (same pattern as
+`examples/router`: a background-thread server, the main thread asserting
+against it over real sockets), and its own section in the README's
+**Modules**.
+
 ## Setup
 
 You'll need the Hydrogen compiler. There's no release binary yet, so build
