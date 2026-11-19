@@ -4,6 +4,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-19 — `Oxygen.Middleware`
+
+From [#4](https://github.com/tetrachromeio/oxygen/issues/4), part of the
 ## 2026-11-19 — `Oxygen.Router`
 
 From [#3](https://github.com/tetrachromeio/oxygen/issues/3), part of the
@@ -11,6 +14,31 @@ From [#3](https://github.com/tetrachromeio/oxygen/issues/3), part of the
 
 ### Added
 
+- **`Oxygen.Middleware`**, a new opt-in submodule: `cors()`,
+  `add_security_headers()`, `request_id()`, `log_access()` — plain
+  functions called directly from your own handler, not `Handler`-wrapping
+  decorators (settled design question from the issue: Oxygen's core
+  `Handler` can't capture variables, so a literal
+  `wrap_cors(handler) -> Handler` isn't possible the way the issue first
+  sketched it).
+- **`Response.status_code()`**, a small core addition this needed: the
+  status a response was sent with, or `0` before it has been. Set once, in
+  `head()` — the single place every send path (`send`, `status`,
+  `begin_events`) already goes through.
+
+### Deferred
+
+- Trusted-proxy header extraction (`Forwarded`/`X-Forwarded-For`). Doing it
+  safely means only honoring those headers when the immediate TCP peer is
+  itself a trusted proxy, and the core doesn't expose a connection's peer
+  address to a handler at all yet. Shipping it without that would mean
+  trusting every client's `Forwarded` header unconditionally — exactly the
+  vulnerability this is supposed to prevent — so it's deferred rather than
+  shipped half-safe. Split out to
+  [#11](https://github.com/tetrachromeio/oxygen/issues/11), blocked on
+  [#10](https://github.com/tetrachromeio/oxygen/issues/10) (exposing a
+  connection's peer address on `Request` — a real core gap found while
+  building this, not originally in scope).
 - **`Oxygen.Router`**, a new opt-in submodule: dynamic path params
   (`/users/:id`), a wildcard tail (`/static/*path`), `router.group(prefix)`
   for a prefixed sub-router, automatic `405 Method Not Allowed` with an

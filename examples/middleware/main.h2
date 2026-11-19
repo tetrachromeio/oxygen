@@ -1,0 +1,160 @@
+// Oxygen.Middleware's self-test, and a small demo of using CORS, security
+// headers, request IDs and access logging together.
+use Elemental
+use Elemental.Net
+use Elemental.System
+use Elemental.Thread
+use Elemental.Time
+use Oxygen
+use Oxygen.Middleware
+
+new function handle(req: Request, res: Response) {
+    if req.get("/strict") {
+        var cfg = default_cors()
+        cfg.allowed_origin = "https://trusted.example"
+        cfg.allow_credentials = true
+        if cors(cfg, req, res) { return }
+        res.text("strict ok")
+        return
+    }
+    if req.get("/footgun") {
+        var cfg = default_cors()
+        cfg.allow_credentials = true   // allowed_origin stays "*" (default_cors())
+        if cors(cfg, req, res) { return }
+        res.text("footgun ok")
+        return
+    }
+    if cors(default_cors(), req, res) { return }
+    add_security_headers(default_security_headers(), res)
+    let id = request_id(req)
+    res.header("X-Request-Id", id.view())
+    let t0 = now()
+
+    if req.get("/") { res.text("Hello, World!") }
+    else { res.not_found() }
+
+    log_access(req, res, id.view(), t0)
+}
+
+new function run_server(port: int) -> int { return serve("127.0.0.1", port, 1, handle) }
+
+new type HeaderCheck {
+    name: str
+    contains: str   // "" just checks the header is present
+}
+
+new function check(port: int, title: str, request: str, want_status: int, header_checks: List<HeaderCheck>) -> bool {
+    match connect("127.0.0.1", port) {
+        Err(e) => {
+            print("FAIL {title}: connect failed: {e}")
+            return false
+        }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            let text = reply.view()
+            var ok = starts_with(text, "HTTP/1.1 {want_status}")
+            for i in 0..int(header_checks.len()) {
+                let hc = header_checks.at(uint(i))
+                var found = false
+                for line in split(text, "\r\n") {
+                    if starts_with(line, hc[0].name + ": ") {
+                        if hc[0].contains.len == 0 { found = true }
+                        else {
+                            match find(line, hc[0].contains) {
+                                Some(_) => { found = true }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                if !found { ok = false }
+            }
+            if ok { print("PASS {title}") }
+            else {
+                print("FAIL {title}:")
+                for line in split(text, "\r\n") { print("    {line}") }
+            }
+            return ok
+        }
+    }
+}
+
+new function main() -> int {
+    var port = 0
+    match listen("127.0.0.1", 0) {
+        Err(e) => {
+            print("no free port: {e}")
+            return 1
+        }
+        Ok(l) => { port = l.port }
+    }
+    let server = spawn(port, run_server)
+    var up = false
+    for attempt in 0..200 {
+        match connect("127.0.0.1", port) {
+            Err(e) => { sleep(0.01) }
+            Ok(c) => { up = true; break }
+        }
+    }
+    if !up {
+        print("server didn't start")
+        exit_now(1)
+    }
+
+    var failures = 0
+
+    var h1 = List<HeaderCheck>()
+    h1.push(HeaderCheck("Access-Control-Allow-Origin", "*"))
+    h1.push(HeaderCheck("X-Content-Type-Options", "nosniff"))
+    h1.push(HeaderCheck("X-Frame-Options", "DENY"))
+    h1.push(HeaderCheck("X-Request-Id", ""))
+    if !check(port, "plain request gets CORS + security + request-id headers",
+              "GET / HTTP/1.1\r\nConnection: close\r\n\r\n", 200, h1) { failures += 1 }
+
+    var h2 = List<HeaderCheck>()
+    h2.push(HeaderCheck("Access-Control-Allow-Methods", ""))
+    h2.push(HeaderCheck("Access-Control-Allow-Headers", ""))
+    if !check(port, "OPTIONS preflight answered directly (204)",
+              "OPTIONS / HTTP/1.1\r\nConnection: close\r\n\r\n", 204, h2) { failures += 1 }
+
+    var h3 = List<HeaderCheck>()
+    h3.push(HeaderCheck("X-Request-Id", "my-own-id"))
+    if !check(port, "an incoming X-Request-Id is echoed back, not replaced",
+              "GET / HTTP/1.1\r\nX-Request-Id: my-own-id\r\nConnection: close\r\n\r\n", 200, h3) { failures += 1 }
+
+    var h4 = List<HeaderCheck>()
+    h4.push(HeaderCheck("Access-Control-Allow-Origin", "https://trusted.example"))
+    h4.push(HeaderCheck("Access-Control-Allow-Credentials", "true"))
+    if !check(port, "exact origin + credentials: both headers sent",
+              "GET /strict HTTP/1.1\r\nConnection: close\r\n\r\n", 200, h4) { failures += 1 }
+
+    var h5 = List<HeaderCheck>()
+    h5.push(HeaderCheck("Access-Control-Allow-Origin", "*"))
+    if !check(port, "wildcard origin + credentials: no Allow-Credentials sent (spec footgun avoided)",
+              "GET /footgun HTTP/1.1\r\nConnection: close\r\n\r\n", 200, h5) { failures += 1 }
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("FAIL footgun connect: {e}"); failures += 1 }
+        Ok(c) => {
+            c.write("GET /footgun HTTP/1.1\r\nConnection: close\r\n\r\n")
+            var reply = string("")
+            c.read_all(reply)
+            var has_creds = false
+            for line in split(reply.view(), "\r\n") {
+                if starts_with(line, "Access-Control-Allow-Credentials") { has_creds = true }
+            }
+            if has_creds {
+                print("FAIL wildcard + credentials incorrectly sent Allow-Credentials")
+                failures += 1
+            } else {
+                print("PASS wildcard + credentials correctly omits Allow-Credentials")
+            }
+        }
+    }
+
+    print("")
+    if failures == 0 { print("all passed") } else { print("{failures} failed") }
+    exit_now(failures)
+    return 0
+}
