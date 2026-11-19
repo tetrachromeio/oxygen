@@ -54,20 +54,26 @@ hy build --release --native
 ./build/selftest
 ```
 
-That prints every test's request and response. If you have a checkout of
-[tetrachromeio/hydrogen](https://github.com/tetrachromeio/hydrogen) too, its
-`tests/oxygen/selftest.out` is the expected output — `selftest`'s output
-should match it byte for byte (aside from the `Date:` header, which changes
-every run):
+That prints every test's request and response — read through it for
+anything that looks wrong, there's no separate golden file to diff against.
+It takes about a minute: two of the cases (idle and incomplete-header
+timeouts) wait out the real default timeouts on purpose, since that's the
+actual behavior being checked. For a faster run while iterating, override
+them to a few seconds:
 
 ```bash
-diff <(./build/selftest) /path/to/hydrogen/tests/oxygen/selftest.out
+OXYGEN_IDLE_TIMEOUT_SECONDS=2 OXYGEN_HEADER_TIMEOUT_SECONDS=2 ./build/selftest
 ```
 
-If you're adding a test case, add it to `examples/selftest/main.h2` and
-update the expected output in the `hydrogen` repo's `tests/oxygen/` in the
-same change (open a PR there too, or say so in this repo's PR — a maintainer
-will sync it).
+(Same env vars `serve`/`serve_with` read in a real server — see the README's
+**Limits** section.) The printed output is identical either way; only the
+wall-clock time changes, so this is safe to use while developing and skip for
+a final check before opening a PR.
+
+If you're adding a test case, add it to `examples/selftest/main.h2`. Keep
+`match_prefix`-based catch-alls (anything that answers every GET it's given,
+falling back to `not_found()`) as the *last* branch in `handle()` — like any
+`if`/`else if` chain, anything after a catch-all is unreachable.
 
 ## Making a change
 

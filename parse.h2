@@ -7,6 +7,7 @@ new type Conn {
     closing: bool         // close once output is sent
     continued: bool       // "100 Continue" already sent for the request being received
     header_scan: int      // how far into input we've already scanned for \r\n\r\n with no luck
+    last_active: int      // unix_time() of the last byte read from or sent to this connection
 }
 
 // Parses and answers every complete request in c's input. Returns false if the

@@ -46,7 +46,9 @@ new type Worker {
     context: Shared<u8>   // serve_with's context; sharing it is the caller's promise
 }
 
-// One thread's event loop. Never returns unless the listener fails.
+// One thread's event loop. Returns once asked to shut down (see
+// install_shutdown_handler()) and every connection it was serving has
+// drained; otherwise never, unless the listener fails.
 new function run_loop(w: Worker) -> int {
     let lfd = w.listen_fd
     let handler = w.handler
@@ -59,12 +61,46 @@ new function run_loop(w: Worker) -> int {
     let datep = ptr<u8>(&date[0])
     http_date(datep)
     var second = unix_time()
+    var shutting_down = false
+    // Read once per thread at startup, not on every tick.
+    var idle_timeout = DEFAULT_IDLE_TIMEOUT_SECONDS
+    match env("OXYGEN_IDLE_TIMEOUT_SECONDS") {
+        Some(v) => { idle_timeout = unwrap_or(parse_int(v.view()), idle_timeout) }
+        None => {}
+    }
+    var header_timeout = DEFAULT_HEADER_TIMEOUT_SECONDS
+    match env("OXYGEN_HEADER_TIMEOUT_SECONDS") {
+        Some(v) => { header_timeout = unwrap_or(parse_int(v.view()), header_timeout) }
+        None => {}
+    }
     while true {
         let n = poller.wait(1000)
         let t = unix_time()
         if t != second {
             second = t
             http_date(datep)
+            // Idle / incomplete-header timeout sweep, and the graceful-shutdown
+            // check: both ride this existing once-a-second tick, so neither
+            // costs an extra syscall on its own.
+            for fd in 0..int(conns.len()) {
+                let c = conns.at(uint(fd))
+                if !c[0].open { continue }
+                let idle = t - c[0].last_active
+                var limit = idle_timeout
+                if c[0].header_scan > 0 { limit = header_timeout }
+                if idle > limit { close_conn(poller, c, fd) }
+            }
+            if !shutting_down && shutdown_requested() {
+                shutting_down = true
+                poller.forget(lfd) // stop accepting; let what's open drain
+            }
+            if shutting_down {
+                var any_open = false
+                for fd in 0..int(conns.len()) {
+                    if conns.at(uint(fd))[0].open { any_open = true; break }
+                }
+                if !any_open { return 0 }
+            }
         }
         for i in 0..n {
             let tok = poller.token(i)
@@ -74,7 +110,7 @@ new function run_loop(w: Worker) -> int {
                     let fd = sock_accept(lfd)
                     if fd < 0 { break }
                     while int(conns.len()) <= fd {
-                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false, 0))
+                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false, 0, 0))
                     }
                     let c = conns.at(uint(fd))
                     if c[0].input.data == null {
@@ -82,6 +118,7 @@ new function run_loop(w: Worker) -> int {
                         c[0].output = buffer(DEFAULT_BUF_BYTES)
                     }
                     c[0].open = true
+                    c[0].last_active = t
                     poller.watch(fd, fd, true, false)
                 }
                 continue
@@ -92,6 +129,7 @@ new function run_loop(w: Worker) -> int {
             if !c[0].open { continue }
             let ready = poller.ready(i)
             if (ready & WRITABLE) != 0 {
+                c[0].last_active = t
                 if !flush_conn(poller, c, fd) {
                     close_conn(poller, c, fd)
                     continue
@@ -130,6 +168,7 @@ new function run_loop(w: Worker) -> int {
                     continue
                 }
                 if got > 0 {
+                    c[0].last_active = t
                     c[0].input.len += got
                     let keep = answer(c, fd, handler, ptr<Header>(&headers[0]), ptr<Buffer>(&extra), datep, w.context.ptr)
                     if !flush_conn(poller, c, fd) {
@@ -156,6 +195,11 @@ pub new function serve(host: str, port: int, threads: int, handler: own Handler)
 // reach shared state (a loaded model, a cache) from a handler, which can't
 // capture variables. With several threads, the state must be safe to share.
 pub new function serve_with(host: str, port: int, threads: int, context: ptr<u8>, handler: own Handler) -> int {
+    // So SIGTERM/SIGINT (e.g. `docker stop`, Ctrl-C) ask every loop to finish
+    // in-flight work and stop accepting new connections, rather than cutting
+    // everything off mid-request. Each loop's own run_loop() checks this on
+    // its once-a-second tick.
+    install_shutdown_handler()
     var count = threads
     if count <= 0 { count = cpu_count() }
     // Linux spreads connections across sockets sharing a port; elsewhere the

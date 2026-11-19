@@ -43,3 +43,21 @@ const BUF_SHRINK_THRESHOLD = 65536
 // multi-megabyte pipelined burst before MAX_PENDING_OUTPUT_BYTES backpressure
 // (in answer()/flush_conn()) ever gets a chance to apply.
 const MAX_RECV_BYTES = 65536
+// How long a connection may sit with no activity (nothing read from it, nothing
+// sent to it) before being dropped: covers a connection that opens and sends
+// nothing, and an idle keep-alive connection waiting for its next request past
+// this point. Checked on the existing once-a-second tick in run_loop, so this
+// costs no extra syscalls. Overridable with OXYGEN_IDLE_TIMEOUT_SECONDS (read
+// once per worker thread at startup, not on every tick) — mainly so tests
+// don't have to wait out the real default.
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 60
+// How long a connection may sit with its headers still incomplete (bytes
+// received, but Conn.header_scan shows no "\r\n\r\n" found yet) before being
+// dropped. Shorter than the idle timeout on purpose: a client drip-feeding a
+// few header bytes every few seconds (Slowloris) is doing something, just
+// slowly and on purpose, so it gets less patience than one simply waiting
+// between requests. A request whose headers are complete but whose body is
+// still arriving (a slow upload) is not this case — it gets the idle timeout,
+// the same as being idle, since that's legitimate. Overridable with
+// OXYGEN_HEADER_TIMEOUT_SECONDS, same caveat as above.
+const DEFAULT_HEADER_TIMEOUT_SECONDS = 10

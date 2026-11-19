@@ -43,6 +43,20 @@ pub new class Request {
     // The path, percent-decoded.
     pub new function decoded_path() -> string { return url_decode(self.path, false) }
 
+    // If the path is `prefix`, or starts with it at a '/' boundary, the rest
+    // of the path after it (a view, no copy) — e.g. `match_prefix("/users")`
+    // on `/users/42` gives `Some("/42")`; on `/userswhatever` gives `None`,
+    // since that's not actually the same path segment. A prefix that itself
+    // ends in '/' matches anything after it, boundary or not (so routers can
+    // mount a whole subtree with one prefix ending in '/').
+    pub new function match_prefix(prefix: str) -> Option<str> {
+        if !starts_with(self.path, prefix) { return None }
+        let rest = slice(self.path, prefix.len, self.path.len)
+        if prefix.len > 0 && prefix[prefix.len - 1] == u8('/') { return Some(rest) }
+        if rest.len == 0 || rest[0] == u8('/') { return Some(rest) }
+        return None
+    }
+
     // The raw (not percent-decoded) value of query parameter `name`, or None.
     pub new function param(name: str) -> Option<str> {
         var start: uint = 0

@@ -28,6 +28,12 @@ new function handle(req: Request, res: Response) {
         res.end_events()
     }
     else if req.get("/silent") {} // no answer: Oxygen sends 500
+    else if req.method == "GET" {
+        match req.match_prefix("/users") {
+            Some(rest) => { res.text("users-rest=[" + string(rest) + "]") }
+            None => { res.not_found() }
+        }
+    }
     else { res.not_found() }
 }
 
@@ -81,7 +87,7 @@ new function main() -> int {
         }
         Ok(l) => { port = l.port }
     }
-    let server = spawn(port, run_server)
+    var server = spawn(port, run_server)
     var up = false
     for attempt in 0..200 {
         match connect("127.0.0.1", port) {
@@ -115,6 +121,61 @@ new function main() -> int {
     exchange(port, "unknown encoding", "POST /echo HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n")
     expect_exchange(port)
     exchange(port, "bad length", "POST /echo HTTP/1.1\r\nContent-Length: 12x\r\n\r\n")
+    exchange(port, "match_prefix: exact", "GET /users HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "match_prefix: with rest", "GET /users/42 HTTP/1.1\r\nConnection: close\r\n\r\n")
+    exchange(port, "match_prefix: not a boundary match", "GET /userswhatever HTTP/1.1\r\nConnection: close\r\n\r\n")
+
+    // Idle and incomplete-header timeouts: each opens its own connection and
+    // waits for the server to close it, so each takes as long as the real
+    // default (DEFAULT_IDLE_TIMEOUT_SECONDS / DEFAULT_HEADER_TIMEOUT_SECONDS in
+    // limits.h2) — around a minute combined. That's the real behavior being
+    // checked, not a stand-in for it.
+    print("(the next two take about a minute combined: the real idle/header timeouts)")
+    exchange(port, "idle timeout (connects, sends nothing)", "")
+    exchange(port, "header timeout (headers never complete)", "GET / HTTP/1.1\r\nX-Partial: ")
+
+    // Graceful shutdown, kept last: raising it ends the server for good.
+    print("== graceful shutdown")
+    match connect("127.0.0.1", port) {
+        Err(e) => { print("connect failed: {e}") }
+        Ok(c) => {
+            // Headers only; the body is held back on purpose, so this is a
+            // genuinely in-flight, incomplete request at the moment shutdown
+            // is asked for.
+            c.write("POST /echo HTTP/1.1\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+            raise_sigterm()
+            sleep(1.5) // let the once-a-second tick notice
+            match connect("127.0.0.1", port) {
+                Err(e) => { print("new connection during shutdown: refused ({e})") }
+                Ok(c2) => {
+                    c2.write("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+                    sock_blocking(c2.fd(), false)
+                    var got_anything = false
+                    for i in 0..20 {
+                        var buf: [u8; 64] = [0]
+                        let n = sock_recv(c2.fd(), ptr<u8>(&buf[0]), 64)
+                        if n > 0 {
+                            got_anything = true
+                            break
+                        }
+                        sleep(0.1)
+                    }
+                    if got_anything { print("new connection during shutdown: served (unexpected)") }
+                    else { print("new connection during shutdown: not served, as expected") }
+                }
+            }
+            // Finish the in-flight request now: it's still answered, proving
+            // shutdown didn't cut off work already in progress.
+            c.write("abcde")
+            var reply = string("")
+            c.read_all(reply)
+            show(reply.view())
+        }
+    }
+    print("waiting for the server to finish draining...")
+    let code = server.join()
+    print("server exited with {code}")
+
     exit_now(0)
     return 0
 }

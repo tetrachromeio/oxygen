@@ -124,6 +124,7 @@ this repo yet.
 | `req.param(name)` | the same, raw (a view: no copy) |
 | `req.decoded_path()` | the path, percent-decoded |
 | `req.header_count`, `req.header_at(i)` | all headers |
+| `req.match_prefix(prefix)` | if the path is `prefix`, or starts with it at a `/` boundary, the rest of the path (a view: no copy) — `Some(rest)` or `None`; a `prefix` itself ending in `/` matches anything after it, boundary or not |
 
 ### `Response`
 | | |
@@ -147,11 +148,18 @@ rejects CR/LF reaching `res.header()`, but it has no idea what your own
 before putting it in HTML or building JSON by hand.
 
 ### `serve(host, port, threads, handler)`, `serve_with(host, port, threads, context, handler)`
-Runs `threads` event loops (0: one per core) and never returns unless it can't
-listen. The handler is a plain function (no captured variables), so every loop
-can call it. `serve_with` hands `context` (a pointer to your app's state) to
-every request as `req.context`; with several threads, that state must be safe
-to share.
+Runs `threads` event loops (0: one per core). The handler is a plain function
+(no captured variables), so every loop can call it. `serve_with` hands
+`context` (a pointer to your app's state) to every request as `req.context`;
+with several threads, that state must be safe to share.
+
+**Graceful shutdown:** both install a SIGTERM/SIGINT handler before starting.
+On either signal, every loop stops accepting new connections and finishes
+draining the ones it has (including letting an in-flight, not-yet-complete
+request finish); `serve`/`serve_with` return once all of them have. A
+connection that was simply sitting idle at the time (not actively mid-request)
+drains via the same idle timeout below, rather than being cut off early —
+within a bound, not held open indefinitely either.
 
 ## Limits (for now)
 
@@ -178,8 +186,15 @@ to share.
   line must end in a real `\r\n` (a bare `\r` is rejected, not treated as one
   anyway); the HTTP version must be exactly `HTTP/1.0` or `HTTP/1.1`; header
   names must be non-empty tokens (no spaces, no control characters).
-- No idle-connection timeout yet — a connection that opens and sends nothing
-  holds its slot indefinitely.
+- A connection that opens and sends nothing, or sits idle between keep-alive
+  requests, is dropped after `OXYGEN_IDLE_TIMEOUT_SECONDS` (default 60); one
+  with an incomplete request — bytes received, but no complete header block
+  yet (Slowloris-style) — after the shorter `OXYGEN_HEADER_TIMEOUT_SECONDS`
+  (default 10). A request whose headers are complete but whose body is still
+  arriving (a slow upload) gets the idle timeout, not the header one, since
+  that's legitimate. Checked on the existing once-a-second tick, so neither
+  costs an extra syscall. Both env vars are read once per worker thread at
+  startup, not on every check.
 - No built-in per-IP or connection-count limiting; that's a proxy/OS job, not
   this framework's.
 

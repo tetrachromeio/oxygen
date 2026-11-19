@@ -4,6 +4,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-19 — idle/header timeouts, graceful shutdown, `match_prefix`
+
+From [#1](https://github.com/tetrachromeio/oxygen/issues/1).
+
+### Added
+
+- **Idle and incomplete-header timeouts.** A connection with no activity
+  (`OXYGEN_IDLE_TIMEOUT_SECONDS`, default 60) or an incomplete request
+  (`OXYGEN_HEADER_TIMEOUT_SECONDS`, default 10 — shorter, to give less
+  patience to a Slowloris-style drip-feed than to a connection simply idling
+  between keep-alive requests) is now dropped rather than held open
+  indefinitely. Both ride the event loop's existing once-a-second tick, so
+  neither costs an extra syscall; both env vars are read once per worker
+  thread at startup.
+- **Graceful shutdown.** `serve`/`serve_with` now install a SIGTERM/SIGINT
+  handler: either stops every loop from accepting new connections and lets
+  what's already open — including an in-flight, not-yet-complete request —
+  finish, rather than cutting everything off mid-request.
+- **`Request.match_prefix(prefix)`** — `Some(rest)` as a zero-copy view into
+  `req.path` if it starts with `prefix` at a `/` boundary, `None` otherwise,
+  for routers built on top of Oxygen that peel off a path prefix.
+
+### Investigated, not built
+
+- A SWAR/bitmask-optimized `req.header()` lookup. Measured first, per the
+  issue's own acceptance criteria: 2,000,000 iterations of 5 lookups each
+  (10,000,000 total, mostly misses against a 3-header request — the worst
+  case) took 0.0264s, ~13.2ns per 5 lookups. Against the ~5,560ns per-request
+  budget implied by the README's ~180k req/s/core number, that's under 0.25%
+  of it. Not worth the complexity; closed as not planned.
+
 ## 2026-11-19 — split from the `hydrogen` monorepo
 
 Pulled out of `tetrachromeio/hydrogen`'s `oxygen/` directory into its own
