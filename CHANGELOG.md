@@ -37,3 +37,40 @@ repo (library, examples, README; the benchmark kit wasn't brought over).
 
 See the security review sent alongside this split for reproduction details
 and verification of each fix.
+
+## 2026-11-19 — 8 more parsing/DoS issues from a follow-up review
+
+- **HTTP request smuggling (CL.TE/TE.CL)**: a request with both
+  `Content-Length` and `Transfer-Encoding: chunked`, or a duplicate
+  `Content-Length`/`Transfer-Encoding` header, is now rejected (400) rather
+  than silently picking one interpretation — a front-end proxy picking the
+  other could let a client smuggle a second, hidden request past it.
+- **`Content-Length` integer overflow**: the digit accumulator is now
+  bounded to 10 digits (413 beyond that), rather than relying only on a
+  post-add `> MAX_BODY_BYTES` check that an overflow could land back under,
+  unnoticed, producing a negative/huge body length and an out-of-bounds
+  read when a handler touches `req.body`.
+- **Server-Sent Events could freeze a whole worker thread forever**:
+  `begin_events()`'s blocking `send()` had no timeout, so a reader that
+  stopped reading could block it indefinitely, stalling every other
+  connection on that thread. Bounded with a new `sock_send_timeout()`.
+- **Permanent peak buffer retention**: a connection that ever handled
+  something large kept that buffer allocation for the rest of the server's
+  life. `close_conn()` now shrinks it back down past a threshold, and one
+  `recv()` call is now capped so it can't pull in an entire large pipelined
+  burst before the existing backpressure gets a chance to apply.
+- **O(N²) CPU cost from a drip-fed header block**: the header-terminator
+  scan restarted from the top on every read. A per-connection cursor now
+  resumes near where the last scan left off.
+- **Lenient parsing that could desync from a front-end proxy**: a bare CR
+  not followed by LF in the request line or a header line is now rejected
+  (400) instead of silently treated as a line ending; the HTTP version must
+  now be exactly `HTTP/1.0` or `HTTP/1.1`; header names must be non-empty
+  RFC 9110 tokens.
+- **`res.send()`'s `content_type` wasn't checked for CRLF** the way
+  `res.header()` is, so an app passing it unsanitized input could still
+  split the response. Now dropped the same way `header()` handles it.
+- **Half-closed (FIN) clients could get a truncated response**: a client
+  that `shutdown(SHUT_WR)`s right after its request, while still reading
+  the response, had its connection closed immediately rather than once its
+  pending output had actually drained.

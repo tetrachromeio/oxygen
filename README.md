@@ -129,7 +129,7 @@ this repo yet.
 | | |
 |---|---|
 | `res.text(body)` `res.json(body)` `res.html(body)` | 200 with that content type |
-| `res.send(status, content_type, body)` | anything else |
+| `res.send(status, content_type, body)` | anything else; the `Content-Type` header is dropped (not sent) if `content_type` contains CR or LF |
 | `res.not_found()` `res.status(code)` | status with its reason as the body |
 | `res.header(name, value)` | extra header (before sending); ignored if `name`/`value` contain CR or LF, or if the response is already sent |
 | `res.close()` | close the connection after this response |
@@ -163,9 +163,19 @@ to share.
   throttled rather than buffered without limit: once ~1 MB of a connection's
   output is unsent, the server stops reading more from it until the backlog
   drains.
-- A handler that takes a long time (e.g. streaming generated text) holds its
-  loop's other connections until it finishes. Run more loops, or keep slow
-  work for dedicated endpoints.
+- A handler that takes a long time to *compute* (e.g. streaming generated
+  text) holds its loop's other connections until it finishes. Run more
+  loops, or keep slow work for dedicated endpoints. Separately, a Server-Sent
+  Events connection whose client stops *reading* doesn't hold the loop
+  forever — the blocking send it uses times out (30s) and the connection is
+  dropped.
+- Requests framed ambiguously (`Content-Length` together with
+  `Transfer-Encoding: chunked`, or either header duplicated) are rejected
+  rather than guessed at, since a front-end proxy guessing differently is
+  exactly how request smuggling happens. The request line and every header
+  line must end in a real `\r\n` (a bare `\r` is rejected, not treated as one
+  anyway); the HTTP version must be exactly `HTTP/1.0` or `HTTP/1.1`; header
+  names must be non-empty tokens (no spaces, no control characters).
 - No idle-connection timeout yet — a connection that opens and sends nothing
   holds its slot indefinitely.
 - No built-in per-IP or connection-count limiting; that's a proxy/OS job, not
