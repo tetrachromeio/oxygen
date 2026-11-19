@@ -41,6 +41,24 @@ const MAX_CHUNK_EXT_BYTES = 4096
 // client that pipelines many requests and never reads its socket can make the
 // server buffer all of their responses in memory at once.
 const MAX_PENDING_OUTPUT_BYTES = 1048576
+// How long a blocking send() for Server-Sent Events may wait before we give up
+// on a reader that's stopped reading. Without a limit, a client that opens an
+// events connection and then never reads it can block that send() forever,
+// freezing this thread's event loop (and every other connection on it) for good.
+const SSE_SEND_TIMEOUT_SECONDS = 30
+// A connection's input/output buffers start at this size and are reused
+// across requests on it. If one ever grows past BUF_SHRINK_THRESHOLD (to
+// handle a large request or response), close_conn() shrinks it back down
+// rather than letting every connection that was ever used for something
+// large permanently keep that peak allocation for as long as the server runs.
+const DEFAULT_BUF_BYTES = 16384
+const BUF_SHRINK_THRESHOLD = 65536
+// The most one sock_recv() call will try to read at once, regardless of how
+// much spare capacity a connection's input buffer happens to already have
+// from an earlier large request. Keeps one read from pulling in an entire
+// multi-megabyte pipelined burst before MAX_PENDING_OUTPUT_BYTES backpressure
+// (in answer()/flush_conn()) ever gets a chance to apply.
+const MAX_RECV_BYTES = 65536
 
 pub new type Header {
     pub name: str
@@ -146,6 +164,25 @@ pub new function url_decode(text: str, plus_as_space: bool) -> string {
 new function has_crlf(text: str) -> bool {
     for i in 0..text.len { if text[i] == u8('\r') || text[i] == u8('\n') { return true } }
     return false
+}
+
+// Is c a valid header-name character (RFC 9110 "tchar")? Rejecting anything
+// else (spaces, control characters, ':') keeps a header name from meaning one
+// thing to us and something else to a front-end proxy parsing the same bytes.
+new function is_tchar(c: u8) -> bool {
+    if c >= u8('a') && c <= u8('z') { return true }
+    if c >= u8('A') && c <= u8('Z') { return true }
+    if c >= u8('0') && c <= u8('9') { return true }
+    if c == u8('!') || c == u8('#') || c == u8('$') || c == u8('%') || c == u8('&') || c == u8('\'') ||
+       c == u8('*') || c == u8('+') || c == u8('-') || c == u8('.') || c == u8('^') || c == u8('_') ||
+       c == u8('`') || c == u8('|') || c == u8('~') { return true }
+    return false
+}
+
+new function valid_header_name(name: str) -> bool {
+    if name.len == 0 { return false }
+    for i in 0..name.len { if !is_tchar(name[i]) { return false } }
+    return true
 }
 
 new function lower(c: u8) -> u8 {
@@ -295,7 +332,10 @@ pub new class Response {
         put(o, reason(status))
         put(o, "\r\nServer: Oxygen\r\nDate: ")
         put(o, str(st[0].date, 29))
-        if content_type.len > 0 {
+        // Dropped rather than rejected, matching header(): a caller passing an
+        // app-controlled content type (built from user input, say) shouldn't be
+        // able to split the response by putting CR/LF in it.
+        if content_type.len > 0 && !has_crlf(content_type) {
             put(o, "\r\nContent-Type: ")
             put(o, content_type)
         }
@@ -340,6 +380,11 @@ pub new class Response {
         self.head(200, "text/event-stream")
         put(st[0].out, "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n")
         sock_blocking(st[0].fd, true)
+        // A blocking send() on this fd can otherwise wait forever for a reader
+        // that's stopped reading, freezing this thread's whole event loop (every
+        // other connection on it) for good. Bound it: event()/end_events() below
+        // treat a send that doesn't finish within this as the client being gone.
+        sock_send_timeout(st[0].fd, SSE_SEND_TIMEOUT_SECONDS)
         self.flush()
     }
 
@@ -360,15 +405,21 @@ pub new class Response {
         if !st[0].streaming { return }
         put(st[0].out, "0\r\n\r\n")
         self.flush()
+        sock_send_timeout(st[0].fd, 0)
         sock_blocking(st[0].fd, false)
         st[0].streaming = false
     }
 
+    // Blocking send on this fd, bounded by the timeout set in begin_events().
+    // Treats anything but a complete send as the client being gone: on a
+    // blocking socket with a send timeout, a short or negative result means
+    // the reader didn't keep up within the timeout, not that it's safe to drop
+    // the rest of this write and move on as if nothing happened.
     new function flush() -> bool {
         let st = self.s
         let o = st[0].out
         if o[0].len > 0 && !st[0].client_gone {
-            if sock_send(st[0].fd, o[0].data, o[0].len) < 0 { st[0].client_gone = true }
+            if sock_send(st[0].fd, o[0].data, o[0].len) != o[0].len { st[0].client_gone = true }
         }
         o[0].len = 0
         return !st[0].client_gone
@@ -385,6 +436,7 @@ new type Conn {
     sent: int             // bytes of output already sent
     closing: bool         // close once output is sent
     continued: bool       // "100 Continue" already sent for the request being received
+    header_scan: int      // how far into input we've already scanned for \r\n\r\n with no luck
 }
 
 // Parses and answers every complete request in c's input. Returns false if the
@@ -396,9 +448,17 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
     let data = c[0].input.data
     let n = c[0].input.len
     while keep && at < n {
-        // Find the end of the header block.
+        // Find the end of the header block. Resume from where a previous call
+        // already scanned with nothing found (header_scan), minus a few bytes in
+        // case a "\r\n\r\n" straddled that boundary, rather than rescanning from
+        // `at` every time: a header block drip-fed one byte per read would
+        // otherwise cost O(size^2), not O(size), to assemble.
         var end = -1
         var i = at
+        if c[0].header_scan > i {
+            i = c[0].header_scan
+            if i > at + 3 { i -= 3 } else { i = at }
+        }
         while i + 3 < n {
             if data[i] == u8('\r') && data[i + 1] == u8('\n') && data[i + 2] == u8('\r') && data[i + 3] == u8('\n') {
                 end = i
@@ -407,9 +467,11 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
             i += 1
         }
         if end < 0 {
+            c[0].header_scan = n
             if n - at > MAX_HEADER_BYTES { return reject(c, 431, date) }
             break
         }
+        c[0].header_scan = 0
         // Request line: METHOD SP TARGET SP HTTP/1.x
         var p = at
         while p < end && data[p] != u8(' ') { p += 1 }
@@ -421,8 +483,16 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
         p += 1
         let v0 = p
         while p < end && data[p] != u8('\r') { p += 1 }
+        // Reaching `end` without finding an earlier \r just means this line's
+        // own terminator is the one at `end` (already confirmed \r\n above) —
+        // normal for the last header/request line. Finding a \r before that is
+        // only valid if \n follows it; a bare \r (one that doesn't) would mean
+        // this scan stopped short of the real line ending, and blindly treating
+        // it as one would read the rest of this line as the start of the next,
+        // which a front-end proxy's own (stricter) parser wouldn't do the same way.
+        if p < end && data[p + 1] != u8('\n') { return reject(c, 400, date) }
         let version = str(ptr<u8>(&data[v0]), uint(p - v0))
-        if method.len == 0 || target.len == 0 || version.len != 8 || !starts_with(version, "HTTP/1.") {
+        if method.len == 0 || target.len == 0 || (version != "HTTP/1.0" && version != "HTTP/1.1") {
             return reject(c, 400, date)
         }
         let minor = int(version[7]) - int('0')
@@ -431,12 +501,16 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
         var count = 0
         var content_length = 0
         var chunked = false
+        var has_content_length = false
+        var has_transfer_encoding = false
         var close_asked = false
         var keep_asked = false
         var expect_continue = false
         while p < end {
             let l0 = p
             while p < end && data[p] != u8('\r') { p += 1 }
+            // Same reasoning as the request line's version check above.
+            if p < end && data[p + 1] != u8('\n') { return reject(c, 400, date) }
             let line = str(ptr<u8>(&data[l0]), uint(p - l0))
             p += 2
             var colon: uint = 0
@@ -444,6 +518,10 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
             if colon == line.len { return reject(c, 400, date) }
             if count == MAX_HEADERS { return reject(c, 431, date) }
             let name = slice(line, 0, colon)
+            // An empty name, or one with characters a header name can't have
+            // (spaces, control characters, ':' itself) risks a front-end proxy
+            // parsing the same header differently than we do.
+            if !valid_header_name(name) { return reject(c, 400, date) }
             var v = colon + 1
             while v < line.len && (line[v] == u8(' ') || line[v] == u8('\t')) { v += 1 }
             var e = line.len
@@ -452,6 +530,19 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
             headers[count] = Header(name, value)
             count += 1
             if same_ignoring_case(name, "content-length") {
+                // A second Content-Length header (even with the same value) is
+                // exactly the kind of thing a front-end proxy and Oxygen could
+                // disagree about, so it's rejected outright rather than only
+                // keeping the last one.
+                if has_content_length { return reject(c, 400, date) }
+                has_content_length = true
+                if value.len == 0 { return reject(c, 400, date) }
+                // More than a handful of digits is already well past
+                // MAX_BODY_BYTES; rejecting here keeps the accumulator far
+                // from ever overflowing, rather than relying on the
+                // MAX_BODY_BYTES check below to catch it after every digit
+                // (which an overflow could land back under, unnoticed).
+                if value.len > 10 { return reject(c, 413, date) }
                 content_length = 0
                 for k in 0..value.len {
                     let d = int(value[k]) - int('0')
@@ -460,6 +551,9 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
                     if content_length > MAX_BODY_BYTES { return reject(c, 413, date) }
                 }
             } else if same_ignoring_case(name, "transfer-encoding") {
+                // Same reasoning as the duplicate Content-Length check above.
+                if has_transfer_encoding { return reject(c, 400, date) }
+                has_transfer_encoding = true
                 if same_ignoring_case(value, "chunked") { chunked = true }
                 else if !same_ignoring_case(value, "identity") { return reject(c, 501, date) }
             } else if same_ignoring_case(name, "expect") {
@@ -469,6 +563,12 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
                 if same_ignoring_case(value, "keep-alive") { keep_asked = true }
             }
         }
+        // A request framed as both chunked and sized is ambiguous: a front-end
+        // proxy that honors one of the two and we the other would disagree
+        // about where this request ends and the next one begins, letting a
+        // client smuggle a second, hidden request past the proxy. Reject it
+        // outright rather than picking one (RFC 9112 §6.1, §6.3).
+        if chunked && has_content_length { return reject(c, 400, date) }
         let body_at = end + 4
         var body_len = content_length
         var next = body_at + content_length   // where the next request starts
@@ -520,6 +620,9 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
         let rest = n - at
         for k in 0..rest { data[k] = data[at + k] }
         c[0].input.len = rest
+        // header_scan (if set) was a position in the old indexing; shift it the
+        // same way the data just moved.
+        if c[0].header_scan > at { c[0].header_scan -= at } else { c[0].header_scan = 0 }
     }
     return keep
 }
@@ -614,6 +717,7 @@ new function reject(c: ptr<Conn>, status: int, date: ptr<u8>) -> bool {
     Response(ptr<ResponseState>(&state)).status(status)
     free_bytes(extra.data)
     c[0].input.len = 0
+    c[0].header_scan = 0
     return false
 }
 
@@ -626,6 +730,15 @@ new function close_conn(poller: var Poller, c: ptr<Conn>, fd: int) {
     c[0].sent = 0
     c[0].closing = false
     c[0].continued = false
+    c[0].header_scan = 0
+    if c[0].input.cap > BUF_SHRINK_THRESHOLD {
+        free_bytes(c[0].input.data)
+        c[0].input = buffer(DEFAULT_BUF_BYTES)
+    }
+    if c[0].output.cap > BUF_SHRINK_THRESHOLD {
+        free_bytes(c[0].output.data)
+        c[0].output = buffer(DEFAULT_BUF_BYTES)
+    }
 }
 
 // Sends what's pending. Returns false if the connection failed.
@@ -669,7 +782,6 @@ new function run_loop(w: Worker) -> int {
     let datep = ptr<u8>(&date[0])
     http_date(datep)
     var second = unix_time()
-    var buf_size = 16384
     while true {
         let n = poller.wait(1000)
         let t = unix_time()
@@ -685,12 +797,12 @@ new function run_loop(w: Worker) -> int {
                     let fd = sock_accept(lfd)
                     if fd < 0 { break }
                     while int(conns.len()) <= fd {
-                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false))
+                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false, 0))
                     }
                     let c = conns.at(uint(fd))
                     if c[0].input.data == null {
-                        c[0].input = buffer(buf_size)
-                        c[0].output = buffer(buf_size)
+                        c[0].input = buffer(DEFAULT_BUF_BYTES)
+                        c[0].output = buffer(DEFAULT_BUF_BYTES)
                     }
                     c[0].open = true
                     poller.watch(fd, fd, true, false)
@@ -717,9 +829,26 @@ new function run_loop(w: Worker) -> int {
             }
             if (ready & (READABLE | HUNG_UP)) != 0 {
                 reserve(ptr<Buffer>(&c[0].input), 4096)
-                let room = c[0].input.cap - c[0].input.len
+                var room = c[0].input.cap - c[0].input.len
+                if room > MAX_RECV_BYTES { room = MAX_RECV_BYTES }
                 let got = sock_recv(fd, ptr<u8>(&c[0].input.data[c[0].input.len]), room)
-                if got == 0 || got == -1 {
+                if got == 0 {
+                    // The client half-closed its write side (FIN): no more
+                    // requests are coming, but it may still be reading a
+                    // response we haven't finished sending (e.g. it wrote its
+                    // request, called shutdown(SHUT_WR), and is waiting to
+                    // read). Closing immediately would truncate that. Stop
+                    // reading, but let the usual WRITABLE path finish sending
+                    // and close once it's done.
+                    if c[0].output.len > c[0].sent {
+                        c[0].closing = true
+                        poller.watch(fd, fd, false, true)
+                    } else {
+                        close_conn(poller, c, fd)
+                    }
+                    continue
+                }
+                if got == -1 {
                     close_conn(poller, c, fd)
                     continue
                 }
