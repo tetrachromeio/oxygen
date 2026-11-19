@@ -32,6 +32,7 @@ new type ResponseState {
     streaming: bool
     client_gone: bool
     head_only: bool       // a HEAD request: headers as for GET, no body
+    blocked: float        // Server-Sent Events: total seconds spent so far blocked in send()
 }
 
 // The response to one request. Write it with one of send / text / json / html /
@@ -118,9 +119,11 @@ pub new class Response {
         sock_blocking(st[0].fd, true)
         // A blocking send() on this fd can otherwise wait forever for a reader
         // that's stopped reading, freezing this thread's whole event loop (every
-        // other connection on it) for good. Bound it: event()/end_events() below
-        // treat a send that doesn't finish within this as the client being gone.
-        sock_send_timeout(st[0].fd, SSE_SEND_TIMEOUT_SECONDS)
+        // other connection on it) for good. This bounds each individual call;
+        // flush() below additionally bounds the running total across all of
+        // them, since a reader that lets just enough through right before each
+        // timeout could otherwise string this along in increments of it forever.
+        sock_send_timeout(st[0].fd, SSE_SEND_PER_CALL_TIMEOUT_SECONDS)
         self.flush()
     }
 
@@ -146,16 +149,21 @@ pub new class Response {
         st[0].streaming = false
     }
 
-    // Blocking send on this fd, bounded by the timeout set in begin_events().
-    // Treats anything but a complete send as the client being gone: on a
-    // blocking socket with a send timeout, a short or negative result means
-    // the reader didn't keep up within the timeout, not that it's safe to drop
-    // the rest of this write and move on as if nothing happened.
+    // Blocking send on this fd, bounded per call by the timeout set in
+    // begin_events(), and in total by SSE_SEND_TOTAL_BLOCKED_SECONDS: a send
+    // that doesn't complete is the client being gone, as is one that completes
+    // but only after this response has already spent too much total time
+    // waiting on sends to this fd — a reader that always lets just enough
+    // through right before each call's own timeout (so no individual send
+    // ever actually fails) would otherwise never be treated as gone at all.
     new function flush() -> bool {
         let st = self.s
         let o = st[0].out
         if o[0].len > 0 && !st[0].client_gone {
-            if sock_send(st[0].fd, o[0].data, o[0].len) != o[0].len { st[0].client_gone = true }
+            let t0 = now()
+            let k = sock_send(st[0].fd, o[0].data, o[0].len)
+            st[0].blocked += now() - t0
+            if k != o[0].len || st[0].blocked > SSE_SEND_TOTAL_BLOCKED_SECONDS { st[0].client_gone = true }
         }
         o[0].len = 0
         return !st[0].client_gone

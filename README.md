@@ -166,9 +166,11 @@ to share.
 - A handler that takes a long time to *compute* (e.g. streaming generated
   text) holds its loop's other connections until it finishes. Run more
   loops, or keep slow work for dedicated endpoints. Separately, a Server-Sent
-  Events connection whose client stops *reading* doesn't hold the loop
-  forever — the blocking send it uses times out (30s) and the connection is
-  dropped.
+  Events connection whose client stops (or slows) *reading* doesn't hold the
+  loop forever — the blocking send it uses is capped per call (5s) and in
+  total (30s cumulative across the whole response, so a reader that lets just
+  enough through right before each call's own timeout can't string it along
+  indefinitely), and the connection is dropped once either is hit.
 - Requests framed ambiguously (`Content-Length` together with
   `Transfer-Encoding: chunked`, or either header duplicated) are rejected
   rather than guessed at, since a front-end proxy guessing differently is

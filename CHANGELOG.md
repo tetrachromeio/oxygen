@@ -53,7 +53,12 @@ and verification of each fix.
 - **Server-Sent Events could freeze a whole worker thread forever**:
   `begin_events()`'s blocking `send()` had no timeout, so a reader that
   stopped reading could block it indefinitely, stalling every other
-  connection on that thread. Bounded with a new `sock_send_timeout()`.
+  connection on that thread. Bounded with a new `sock_send_timeout()` — and,
+  after testing the fix turned up that a per-call timeout alone isn't
+  sufficient (a reader that lets just enough through right before each call's
+  own timeout, never actually failing one, could still string a connection
+  along in increments of it forever), a running total across the whole
+  response's sends, capped independently of any individual call's outcome.
 - **Permanent peak buffer retention**: a connection that ever handled
   something large kept that buffer allocation for the rest of the server's
   life. `close_conn()` now shrinks it back down past a threshold, and one

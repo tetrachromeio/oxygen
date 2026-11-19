@@ -171,7 +171,7 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
         // earlier request (this connection's or another's) can leak into this
         // one's headers.
         extra[0].len = 0
-        var state = ResponseState(ptr<Buffer>(&c[0].output), extra, fd, date, keep, false, false, false, method == "HEAD")
+        var state = ResponseState(ptr<Buffer>(&c[0].output), extra, fd, date, keep, false, false, false, method == "HEAD", 0.0)
         let res = Response(ptr<ResponseState>(&state))
         handler(req, res)
         if !state.sent { res.status(500) }
@@ -283,7 +283,7 @@ new function join_chunks(data: ptr<u8>, at: int, end: int) -> int {
 
 new function reject(c: ptr<Conn>, status: int, date: ptr<u8>) -> bool {
     var extra = buffer(16)
-    var state = ResponseState(ptr<Buffer>(&c[0].output), ptr<Buffer>(&extra), -1, date, false, false, false, false, false)
+    var state = ResponseState(ptr<Buffer>(&c[0].output), ptr<Buffer>(&extra), -1, date, false, false, false, false, false, 0.0)
     Response(ptr<ResponseState>(&state)).status(status)
     free_bytes(extra.data)
     c[0].input.len = 0

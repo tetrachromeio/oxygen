@@ -12,11 +12,24 @@ const MAX_CHUNK_EXT_BYTES = 4096
 // client that pipelines many requests and never reads its socket can make the
 // server buffer all of their responses in memory at once.
 const MAX_PENDING_OUTPUT_BYTES = 1048576
-// How long a blocking send() for Server-Sent Events may wait before we give up
-// on a reader that's stopped reading. Without a limit, a client that opens an
-// events connection and then never reads it can block that send() forever,
-// freezing this thread's event loop (and every other connection on it) for good.
-const SSE_SEND_TIMEOUT_SECONDS = 30
+// Server-Sent Events: a blocking send() that doesn't complete within this many
+// seconds fails it outright (a hard per-call cap at the socket level, SO_SNDTIMEO).
+// On its own this isn't enough: a reader that lets just enough through right
+// before each timeout (never actually failing a send, just always slow) could
+// string a connection along in increments of this, for as long as it keeps
+// timing it right. SSE_SEND_TOTAL_BLOCKED_SECONDS below is what actually bounds
+// that, by capping the running total instead of resetting every call.
+const SSE_SEND_PER_CALL_TIMEOUT_SECONDS = 5
+// Server-Sent Events: once the total time spent so far blocked inside send()
+// for one response (ResponseState.blocked, summed across every call, win or
+// lose) crosses this, the client is treated as gone — regardless of whether
+// the most recent individual send happened to complete. Bounds the worst case
+// to roughly this plus one more SSE_SEND_PER_CALL_TIMEOUT_SECONDS, rather than
+// an attacker being able to keep narrowly beating each call's own timeout
+// forever. Without any of this, a client that opens an events connection and
+// never reads it can block that send() forever, freezing this thread's event
+// loop (and every other connection on it) for good.
+const SSE_SEND_TOTAL_BLOCKED_SECONDS = 30.0
 // A connection's input/output buffers start at this size and are reused
 // across requests on it. If one ever grows past BUF_SHRINK_THRESHOLD (to
 // handle a large request or response), close_conn() shrinks it back down
