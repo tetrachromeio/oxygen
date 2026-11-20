@@ -22,8 +22,9 @@ new function main() -> int { return serve("127.0.0.1", 8080, 0, handle) }   // 0
 ## Status
 
 Pre-1.0. The API in this README is what's shipped and tested; it can still
-change. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test it,
-and [SECURITY.md](SECURITY.md) to report a vulnerability privately.
+change. See [ROADMAP.md](ROADMAP.md) for what 1.0 means and what's left,
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test it, and
+[SECURITY.md](SECURITY.md) to report a vulnerability privately.
 
 ## Installation
 
