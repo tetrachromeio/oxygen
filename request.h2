@@ -14,6 +14,7 @@ pub new class Request {
     headers: ptr<Header>
     pub header_count: int
     pub context: ptr<u8>  // what serve_with was given (the app's shared state), or null
+    pub peer: str         // the TCP peer's "ip:port" (IPv6 bracketed), or "" if unknown
 
     pub new function is(method: str, path: str) -> bool { return self.method == method && self.path == path }
     // GET, or HEAD (answered the same way, without the body).
