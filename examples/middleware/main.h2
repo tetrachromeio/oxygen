@@ -9,6 +9,23 @@ use Oxygen
 use Oxygen.Middleware
 
 new function handle(req: Request, res: Response) {
+    if req.get("/whoami") {
+        // A reverse proxy at this test's loopback peer address is trusted:
+        // Forwarded/X-Forwarded-For are honored.
+        var trusted = List<str>()
+        trusted.push("127.0.0.1")
+        trusted.push("10.0.0.2") // a second, chained trusted proxy for the multi-hop case
+        res.text(trusted_proxy_addr(req, trusted))
+        return
+    }
+    if req.get("/whoami-untrusted") {
+        // The exact same request, but this server doesn't consider the
+        // loopback peer a trusted proxy: the headers must be ignored outright.
+        var trusted = List<str>()
+        trusted.push("10.0.0.9")
+        res.text(trusted_proxy_addr(req, trusted))
+        return
+    }
     if req.get("/strict") {
         var cfg = default_cors()
         cfg.allowed_origin = "https://trusted.example"
@@ -79,6 +96,29 @@ new function check(port: int, title: str, request: str, want_status: int, header
             return ok
         }
     }
+}
+
+// Sends `request` and returns the response body (everything after the blank
+// line), or "" if the connection failed or there was no blank line.
+new function body_of(port: int, request: str) -> string {
+    match connect("127.0.0.1", port) {
+        Err(e) => { return string("") }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            match find(reply.view(), "\r\n\r\n") {
+                None => { return string("") }
+                Some(at) => { return string(slice(reply.view(), at + 4, reply.view().len)) }
+            }
+        }
+    }
+}
+
+new function check_body(title: str, got: str, want: str) -> bool {
+    if got == want { print("PASS {title}"); return true }
+    print("FAIL {title}: got {got}, want {want}")
+    return false
 }
 
 new function main() -> int {
@@ -152,6 +192,34 @@ new function main() -> int {
             }
         }
     }
+
+    // trusted_proxy_addr: trusted peer, no forwarded header -> the real peer itself.
+    let peer_only = body_of(port, "GET /whoami HTTP/1.1\r\nConnection: close\r\n\r\n")
+    if starts_with(peer_only.view(), "127.0.0.1:") { print("PASS trusted peer, no header: returns req.peer") }
+    else { print("FAIL trusted peer, no header: got {peer_only}"); failures += 1 }
+
+    // trusted peer, one untrusted hop in X-Forwarded-For -> that hop, honored.
+    if !check_body("trusted peer: single forwarded hop honored",
+                    body_of(port, "GET /whoami HTTP/1.1\r\nX-Forwarded-For: 203.0.113.5\r\nConnection: close\r\n\r\n").view(),
+                    "203.0.113.5") { failures += 1 }
+
+    // trusted peer, two-hop chain where the nearer hop (10.0.0.2) is also a
+    // trusted proxy: resolved to the right-most *untrusted* entry
+    // (198.51.100.7), not naively the first or last item in the header.
+    if !check_body("trusted peer: multi-hop chain resolves to right-most untrusted entry",
+                    body_of(port, "GET /whoami HTTP/1.1\r\nX-Forwarded-For: 198.51.100.7, 10.0.0.2\r\nConnection: close\r\n\r\n").view(),
+                    "198.51.100.7") { failures += 1 }
+
+    // The one that actually matters: an UNTRUSTED peer's forged
+    // X-Forwarded-For must be ignored outright, not honored.
+    let forged = body_of(port, "GET /whoami-untrusted HTTP/1.1\r\nX-Forwarded-For: 1.2.3.4\r\nConnection: close\r\n\r\n")
+    if starts_with(forged.view(), "127.0.0.1:") { print("PASS untrusted peer: forged X-Forwarded-For ignored, real peer returned") }
+    else { print("FAIL untrusted peer: forged header was honored, got {forged}"); failures += 1 }
+
+    // Forwarded (RFC 7239) is read too, not just X-Forwarded-For.
+    if !check_body("trusted peer: RFC 7239 Forwarded header's for= is honored",
+                    body_of(port, "GET /whoami HTTP/1.1\r\nForwarded: for=203.0.113.9;proto=https\r\nConnection: close\r\n\r\n").view(),
+                    "203.0.113.9") { failures += 1 }
 
     print("")
     if failures == 0 { print("all passed") } else { print("{failures} failed") }
