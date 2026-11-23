@@ -1,0 +1,136 @@
+// Oxygen.Test's self-test: checks dispatch() produces byte-for-byte the
+// same response as the real socket path (minus the Date header, which
+// varies), for everything that isn't a core timeout/half-close/SSE case —
+// those are explicitly socket-level behaviors, out of scope here. Also
+// measures dispatch() against a real round trip, to show the speed
+// difference this module exists for.
+use Elemental
+use Elemental.Net
+use Elemental.System
+use Elemental.Thread
+use Elemental.Time
+use Oxygen
+use Oxygen.Test
+
+new function handle(req: Request, res: Response) {
+    if req.get("/") { res.text("Hello, World!") }
+    else if req.get("/greet") {
+        match req.param_text("name") {
+            None => { res.send(400, "text/plain", "no name") }
+            Some(n) => { res.text("hello " + n) }
+        }
+    }
+    else if req.get("/agent") { res.text("agent=" + string(req.header("USER-AGENT"))) }
+    else if req.post("/echo") {
+        res.header("X-Length", "{req.body.len}")
+        res.send(201, "application/octet-stream", req.body)
+    }
+    else { res.not_found() }
+}
+
+new function run_server(port: int) -> int { return serve("127.0.0.1", port, 1, handle) }
+
+// Strips the Date line (it varies run to run) so a comparison is meaningful.
+new function without_date(reply: str) -> string {
+    var out = string("")
+    for line in split(reply, "\r\n") {
+        if !starts_with(line, "Date: ") {
+            out.append(line)
+            out.append("\n")
+        }
+    }
+    return out
+}
+
+new function real_socket_exchange(port: int, request: str) -> string {
+    match connect("127.0.0.1", port) {
+        Err(e) => { return string("connect failed: {e}") }
+        Ok(c) => {
+            c.write(request)
+            var reply = string("")
+            c.read_all(reply)
+            return without_date(reply.view())
+        }
+    }
+}
+
+new function main() -> int {
+    var port = 0
+    match listen("127.0.0.1", 0) {
+        Err(e) => {
+            print("no free port: {e}")
+            return 1
+        }
+        Ok(l) => { port = l.port }
+    }
+    let server = spawn(port, run_server)
+    var up = false
+    for attempt in 0..200 {
+        match connect("127.0.0.1", port) {
+            Err(e) => { sleep(0.01) }
+            Ok(c) => { up = true; break }
+        }
+    }
+    if !up {
+        print("server didn't start")
+        exit_now(1)
+    }
+
+    var failures = 0
+    var cases = List<string>()
+    cases.push(string("GET / HTTP/1.1\r\nConnection: close\r\n\r\n"))
+    cases.push(string("GET /greet?name=oxygen HTTP/1.1\r\nConnection: close\r\n\r\n"))
+    cases.push(string("GET /greet HTTP/1.1\r\nConnection: close\r\n\r\n"))
+    cases.push(string("GET /agent HTTP/1.1\r\nuser-agent: tester/1\r\nConnection: close\r\n\r\n"))
+    cases.push(string("POST /echo HTTP/1.1\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world"))
+    cases.push(string("GET /nope HTTP/1.1\r\nConnection: close\r\n\r\n"))
+
+    for i in 0..int(cases.len()) {
+        let req = cases.at(uint(i))
+        let via_socket = real_socket_exchange(port, req[0].view())
+        let full_via_dispatch = dispatch_in_memory(handle, req[0].view())
+        let via_dispatch = without_date(full_via_dispatch.view())
+        if via_socket.view() == via_dispatch.view() {
+            print("PASS parity: {req[0]}")
+        } else {
+            print("FAIL parity: {req[0]}")
+            print("  via socket:   {via_socket}")
+            print("  via dispatch: {via_dispatch}")
+            failures += 1
+        }
+    }
+
+    // Convenience wrapper (status/headers/body parsed out).
+    let resp = dispatch(handle, "GET /greet?name=oxygen HTTP/1.1\r\nConnection: close\r\n\r\n")
+    if resp.status == 200 && resp.body.view() == "hello oxygen" {
+        print("PASS TestResponse convenience: status={resp.status} body={resp.body}")
+    } else {
+        print("FAIL TestResponse convenience: status={resp.status} body={resp.body}")
+        failures += 1
+    }
+    if resp.header("Content-Type") == "text/plain" {
+        print("PASS TestResponse.header()")
+    } else {
+        print("FAIL TestResponse.header(): got [{resp.header(\"Content-Type\")}]")
+        failures += 1
+    }
+
+    // Speed: dispatch() vs a real round trip, same request, same handler.
+    let iters = 2000
+    let req = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n"
+    let t0 = now()
+    for i in 0..iters { dispatch_in_memory(handle, req) }
+    let dispatch_time = now() - t0
+
+    let t1 = now()
+    for i in 0..iters { real_socket_exchange(port, req) }
+    let socket_time = now() - t1
+
+    print("")
+    print("{iters} iterations: dispatch()={dispatch_time}s, real socket={socket_time}s, speedup={socket_time / dispatch_time}x")
+
+    print("")
+    if failures == 0 { print("all passed") } else { print("{failures} failed") }
+    exit_now(failures)
+    return 0
+}

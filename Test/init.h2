@@ -1,0 +1,91 @@
+// Oxygen.Test: an in-process request/response harness — no sockets, no
+// port, so a test using it is fast, deterministic, and safe to run many of
+// in parallel.
+//
+//     use Oxygen
+//     use Oxygen.Test
+//
+//     let resp = dispatch(handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+//     assert(resp.status == 200)
+//     assert(resp.body.view() == "Hello, World!")
+//
+// Not for Server-Sent Events: begin_events()/event()/end_events() write
+// directly to a socket, and there isn't one here. Test a streaming handler
+// the normal way, against real sockets (see examples/selftest's pattern).
+use Elemental
+use Oxygen
+
+// Unlike the core's own Header (a zero-copy view into a connection's
+// long-lived input buffer — appropriate there, not here), these own their
+// bytes: the raw response text they're parsed from is a short-lived local
+// in dispatch(), gone by the time the caller gets a TestResponse back, so
+// a view into it would dangle.
+pub new type TestHeader {
+    pub name: string
+    pub value: string
+}
+
+pub new class TestResponse {
+    pub status: int
+    pub headers: List<TestHeader>
+    pub body: string
+
+    // The value of header `name` (any case), or "" if it isn't there —
+    // same shape as Request.header(), for symmetry in test code.
+    pub new function header(name: str) -> str {
+        for i in 0..int(self.headers.len()) {
+            let h = self.headers.at(uint(i))
+            if same_ignoring_case(h[0].name.view(), name) { return h[0].value.view() }
+        }
+        return ""
+    }
+}
+
+// Runs `handler` against `raw_request` with no socket involved, and parses
+// the result into a status code, headers, and body. See
+// dispatch_in_memory (the core function this builds on) for what doesn't
+// work through this (Server-Sent Events).
+pub new function dispatch(handler: Handler, raw_request: str) -> TestResponse {
+    let raw = dispatch_in_memory(handler, raw_request)
+    return parse_response(raw.view())
+}
+
+new function parse_response(raw: str) -> TestResponse {
+    var status = 0
+    var headers = List<TestHeader>()
+    var body = string("")
+
+    var p: uint = 0
+    while p < raw.len && raw[p] != u8('\r') { p += 1 }
+    let status_line = slice(raw, 0, p)
+    var sp: uint = 0
+    while sp < status_line.len && status_line[sp] != u8(' ') { sp += 1 }
+    var code_end = sp + 1
+    while code_end < status_line.len && status_line[code_end] != u8(' ') { code_end += 1 }
+    match parse_int(slice(status_line, sp + 1, code_end)) {
+        Some(s) => { status = s }
+        None => {}
+    }
+    p += 2 // past the status line's \r\n
+
+    while p + 1 < raw.len {
+        var le = p
+        while le < raw.len && raw[le] != u8('\r') { le += 1 }
+        if le == p {
+            p = le + 2
+            break // the blank line ending the headers
+        }
+        let line = slice(raw, p, le)
+        var colon: uint = 0
+        while colon < line.len && line[colon] != u8(':') { colon += 1 }
+        if colon < line.len {
+            let name = slice(line, 0, colon)
+            var v = colon + 1
+            while v < line.len && line[v] == u8(' ') { v += 1 }
+            headers.push(TestHeader(string(name), string(slice(line, v, line.len))))
+        }
+        p = le + 2
+    }
+    body.append(slice(raw, p, raw.len))
+    return TestResponse(status, headers, body)
+}

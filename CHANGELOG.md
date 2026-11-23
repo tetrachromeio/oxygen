@@ -4,6 +4,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-19 — `Oxygen.Test`: in-process request/response harness
+
+From [#8](https://github.com/tetrachromeio/oxygen/issues/8), part of the
+Extended/Ecosystem tracking issue [#2](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Added
+
+- **`Oxygen.Test`**: `dispatch(handler, raw_request) -> TestResponse` runs a
+  `Handler` against a raw HTTP request with no socket, no port, and no
+  thread — for fast, deterministic tests that don't need to be safe to run
+  many of in parallel against real ports.
+- **`dispatch_in_memory(handler, raw_request) -> string`**, new on the core
+  (`parse.h2`): builds a dummy, fd-less `Conn` and feeds it through the
+  existing private `answer()` — the same parser and dispatch path a real
+  connection uses — so the test harness has nothing of its own to drift out
+  of sync with the real one.
+- `TestResponse` owns its header/body bytes (a new `TestHeader` type, not
+  the core's view-based `Header`): the raw response text it's parsed from is
+  a short-lived local inside `dispatch()`, gone by the time the caller gets
+  a `TestResponse` back, so a zero-copy view into it would dangle. Caught by
+  design review before writing the parser, not by a crash.
+
+### Measured
+
+- `examples/testharness` checks `dispatch()`'s output byte-for-byte (minus
+  the ticking `Date` header) against the same requests over a real loopback
+  socket, across six request shapes (root, query string, missing query
+  param, header read, POST body, 404).
+- 2000 iterations: `dispatch()` 0.00234s vs. a real socket round-trip
+  0.12351s — about **53x** faster, the actual point of an in-process
+  harness rather than something to assume.
 ## 2026-11-20 — connection peer address, trusted-proxy header extraction
 
 From [#10](https://github.com/tetrachromeio/oxygen/issues/10) and

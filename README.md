@@ -330,6 +330,59 @@ See [SECURITY.md](SECURITY.md) for how to report problems with this list
 being wrong (e.g. something above being bypassable) versus just living with
 it.
 
+## Modules
+
+Opt-in layers on top of the core, each its own submodule — `use Oxygen` alone
+never pulls one in, so a service that doesn't need it pays nothing for it.
+
+### `Oxygen.Test`
+
+An in-process request/response harness: runs your `Handler` against a raw
+HTTP request with no socket, no port, and no thread, and hands back the
+parsed status, headers and body.
+
+```
+use Elemental
+use Oxygen
+use Oxygen.Test
+
+new function handle(req: Request, res: Response) {
+    if req.get("/") { res.text("Hello, World!") }
+    else { res.not_found() }
+}
+
+new function main() -> int {
+    let resp = dispatch(handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+    assert(resp.status == 200)
+    assert(resp.body.view() == "Hello, World!")
+    assert(resp.header("Content-Type") == "text/plain")
+    return 0
+}
+```
+
+- `dispatch(handler, raw_request) -> TestResponse`: runs the exact same
+  parser and handler dispatch a real connection would (`dispatch_in_memory`,
+  new on the core for this — a dummy, fd-less `Conn`, so there's no
+  duplicate parser to drift from the real one), and parses the raw response
+  back into a `TestResponse`.
+- `TestResponse`: `.status`, `.headers` (a `List<TestHeader>`, each a
+  `.name`/`.value` pair), `.body`, and `.header(name) -> str` (any case, ""
+  if absent — same shape as `Request.header()`). Unlike the core's own
+  `Header`, these own their bytes rather than viewing into a buffer: the raw
+  response text is a short-lived local inside `dispatch()`, gone by the time
+  you get a `TestResponse` back, so a view into it would dangle.
+
+**Not for Server-Sent Events** — `begin_events()`/`event()`/`end_events()`
+write straight to a socket, and there isn't one here. Test a streaming
+handler the normal way, against real sockets (see `examples/selftest`'s
+pattern).
+
+Measured in `examples/testharness`: parity with the real-socket path is
+checked byte-for-byte (minus the `Date` header, which ticks) across several
+request shapes, and `dispatch()` runs roughly 50x faster per call than the
+same requests over a real loopback socket — the actual point of a harness
+like this, rather than something to take on faith.
+
 ## Testing
 
 ```bash
