@@ -98,7 +98,8 @@ this repo yet.
 
 ## Why it's fast
 
-- **One event loop per core** (epoll on Linux, kqueue on macOS), each with its
+- **One event loop per core** (epoll on Linux, kqueue on macOS; `select()` on
+  Windows — see **Limits**), each with its
   own listening socket that the kernel spreads connections across (Linux).
   Loops share nothing: no locks, no work stealing, no atomics on the request
   path.
@@ -260,6 +261,19 @@ magnitude larger, or traffic that's mostly 404s.
 
 ## Limits (for now)
 
+- **Windows: compiles and links, unverified by execution.** The runtime
+  (`h2rt.c`, hydrogen repo) has a Winsock/`select()`-based port — checked to
+  compile and link cleanly against a real `x86_64-w64-mingw32-gcc-posix`
+  cross-toolchain, zero warnings even with `-Wall` — but nobody has run the
+  resulting binary on actual Windows yet. Known gaps even once it is:
+  `select()` is O(n) per wait and capped at 1024 sockets (raised from the
+  default 64, but still nowhere near epoll/kqueue's scaling — a real port
+  would want IOCP, a different async model entirely); there's no
+  `SO_REUSEPORT` equivalent, so `share_port` is a no-op there the same as it
+  already is on anything non-Linux; external process termination (service
+  stop, Task Manager) doesn't deliver a signal Windows' C runtime forwards
+  as `SIGTERM`, so graceful shutdown only works when something in-process
+  calls `raise_sigterm()` itself, not from outside.
 - No TLS: put Oxygen behind a proxy for HTTPS.
 - Bodies up to 16 MB, up to 64 headers; transfer encodings other than chunked
   get 501. Chunk extensions and trailer lines are capped (4 KB / 64 KB) rather
