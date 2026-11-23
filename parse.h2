@@ -8,6 +8,7 @@ new type Conn {
     continued: bool       // "100 Continue" already sent for the request being received
     header_scan: int      // how far into input we've already scanned for \r\n\r\n with no luck
     last_active: int      // unix_time() of the last byte read from or sent to this connection
+    peer: string          // "ip:port" of the TCP peer, captured once at accept() time
 }
 
 // Parses and answers every complete request in c's input. Returns false if the
@@ -166,13 +167,14 @@ new function answer(c: ptr<Conn>, fd: int, handler: Handler, headers: ptr<Header
         var query = ""
         if q < target.len { query = slice(target, q + 1, target.len) }
         let req = Request(method, target, slice(target, 0, q), query,
-                          str(ptr<u8>(&data[body_at]), uint(body_len)), minor, headers, count, context)
+                          str(ptr<u8>(&data[body_at]), uint(body_len)), minor, headers, count, context,
+                          c[0].peer.view())
         // `extra` is one buffer shared by every connection this worker thread
         // serves; clear it before each response so nothing left over from an
         // earlier request (this connection's or another's) can leak into this
         // one's headers.
         extra[0].len = 0
-        var state = ResponseState(ptr<Buffer>(&c[0].output), extra, fd, date, keep, false, false, false, method == "HEAD", 0.0)
+        var state = ResponseState(ptr<Buffer>(&c[0].output), extra, fd, date, keep, false, false, false, method == "HEAD", 0.0, 0)
         let res = Response(ptr<ResponseState>(&state))
         handler(req, res)
         if !state.sent { res.status(500) }
@@ -284,7 +286,7 @@ new function join_chunks(data: ptr<u8>, at: int, end: int) -> int {
 
 new function reject(c: ptr<Conn>, status: int, date: ptr<u8>) -> bool {
     var extra = buffer(16)
-    var state = ResponseState(ptr<Buffer>(&c[0].output), ptr<Buffer>(&extra), -1, date, false, false, false, false, false, 0.0)
+    var state = ResponseState(ptr<Buffer>(&c[0].output), ptr<Buffer>(&extra), -1, date, false, false, false, false, false, 0.0, 0)
     Response(ptr<ResponseState>(&state)).status(status)
     free_bytes(extra.data)
     c[0].input.len = 0

@@ -33,6 +33,7 @@ new type ResponseState {
     client_gone: bool
     head_only: bool       // a HEAD request: headers as for GET, no body
     blocked: float        // Server-Sent Events: total seconds spent so far blocked in send()
+    status_code: int      // the status this response was (or will be) sent with; 0 before head()
 }
 
 // The response to one request. Write it with one of send / text / json / html /
@@ -43,6 +44,8 @@ pub new class Response {
 
     pub new function sent() -> bool { return self.s[0].sent }
     pub new function client_gone() -> bool { return self.s[0].client_gone }
+    // The status this response was sent with, or 0 if it hasn't been yet.
+    pub new function status_code() -> int { return self.s[0].status_code }
     // Ask to close the connection after this response.
     pub new function close() { self.s[0].keep_alive = false }
 
@@ -62,6 +65,7 @@ pub new class Response {
 
     new function head(status: int, content_type: str) {
         let st = self.s
+        st[0].status_code = status
         let o = st[0].out
         put(o, "HTTP/1.1 ")
         put_int(o, status)

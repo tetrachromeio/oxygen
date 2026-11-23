@@ -1,0 +1,238 @@
+// Oxygen.Router: a small router for Oxygen, opt-in and separate from the
+// core (bare `use Oxygen` never pulls this in, so a service that doesn't
+// route doesn't pay for it).
+//
+//     use Oxygen
+//     use Oxygen.Router
+//
+//     new function list_users(req: Request, res: Response, p: Params) { res.text("list") }
+//     new function get_user(req: Request, res: Response, p: Params) {
+//         match p.get("id") {
+//             Some(id) => { res.text("user " + string(id)) }
+//             None => { res.status(400) }
+//         }
+//     }
+//
+//     new function main() -> int {
+//         var router = Router()
+//         router.get("/users", list_users)
+//         router.get("/users/:id", get_user)
+//         return serve_with("127.0.0.1", 8080, 1, ptr<u8>(&router), dispatch_handler)
+//     }
+//
+// Register every route before calling serve()/serve_with(), not after:
+// dispatch (handle(), below) only reads the route table, but every worker
+// thread reads it without synchronization, the same way `context` already
+// works for app state shared across threads. If you also need your own
+// app-level context, add a field to your own struct that embeds a Router,
+// rather than fighting over the one `context` pointer.
+//
+// Routes are matched with a linear scan, not a trie — much less code, and
+// measured (see CHANGELOG.md) at ~0.3us/dispatch for a 50-route table
+// regardless of where the match lands (first route, last, or no match at
+// all after scanning everything) — around 5% of the ~5.5us/request budget
+// implied by the README's ~180k req/s/core number, in the worst case. Real
+// but not dominant at this scale; a trie would matter more for a route
+// table orders of magnitude larger, or an app whose traffic is mostly 404s.
+use Elemental
+use Oxygen
+
+pub const MAX_ROUTE_PARAMS = 8
+// How many methods can match the same path before `Allow` on a 405/OPTIONS
+// response stops listing them. 8 covers every standard HTTP method with room
+// to spare; a route table that needs more than that for one path is unusual
+// enough not to design around.
+const MAX_ALLOWED_METHODS = 8
+
+new enum SegKind {
+    Literal
+    Param
+    Wildcard
+}
+
+new function is_param(k: SegKind) -> bool {
+    match k {
+        Param => { return true }
+        Literal => { return false }
+        Wildcard => { return false }
+    }
+}
+
+new function is_wildcard(k: SegKind) -> bool {
+    match k {
+        Wildcard => { return true }
+        Literal => { return false }
+        Param => { return false }
+    }
+}
+
+// One segment of a registered pattern: a literal to match exactly, a `:name`
+// to capture, or a `*name` tail that captures everything remaining (must be
+// the pattern's last segment; one after it is never reached).
+new type Seg {
+    kind: SegKind
+    text: string   // the literal text, or the param/wildcard's name
+}
+
+pub new type RouteHandler = function(Request, Response, Params)
+
+// Captured path parameters from a matched route: zero-copy views into the
+// request's path, valid for as long as the request is (same lifetime as
+// everything else on Request).
+pub new class Params {
+    names: [str; 8]
+    values: [str; 8]
+    count: int
+
+    pub new function get(name: str) -> Option<str> {
+        for i in 0..self.count {
+            if self.names[i] == name { return Some(self.values[i]) }
+        }
+        return None
+    }
+}
+
+new function no_params() -> Params { return Params([""], [""], 0) }
+
+// Parses "/users/:id/*rest" into [Literal "users", Param "id", Wildcard "rest"].
+// Parsing happens once at registration (startup), not per request, so it
+// allocates (one `string` per segment) without it costing anything on the
+// request path.
+new function parse_segments(pattern: str) -> List<Seg> {
+    var segs = List<Seg>()
+    var start: uint = 0
+    if pattern.len > 0 && pattern[0] == u8('/') { start = 1 }
+    var i = start
+    while i <= pattern.len {
+        var end = i
+        while end < pattern.len && pattern[end] != u8('/') { end += 1 }
+        if end > i {
+            let part = slice(pattern, i, end)
+            if part[0] == u8(':') {
+                segs.push(Seg(Param, string(slice(part, 1, part.len))))
+            } else if part[0] == u8('*') {
+                segs.push(Seg(Wildcard, string(slice(part, 1, part.len))))
+            } else {
+                segs.push(Seg(Literal, string(part)))
+            }
+        }
+        i = end + 1
+    }
+    return segs
+}
+
+// Tries to match `path` against a parsed pattern, filling `out` with any
+// captured params. A trailing '/' in `path` (other than the root "/" itself)
+// is insignificant, same as most routers treat it.
+new function try_match(segs: ptr<List<Seg>>, path: str, out: ptr<Params>) -> bool {
+    var plen = path.len
+    if plen > 1 && path[plen - 1] == u8('/') { plen -= 1 }
+    var p: uint = 0
+    if plen > 0 && path[0] == u8('/') { p = 1 }
+    let n = int(segs[0].len())
+    for i in 0..n {
+        let seg = segs[0].at(uint(i))
+        if is_wildcard(seg[0].kind) {
+            if out[0].count < MAX_ROUTE_PARAMS {
+                out[0].names[out[0].count] = seg[0].text.view()
+                out[0].values[out[0].count] = slice(path, p, plen)
+                out[0].count += 1
+            }
+            return true // a wildcard always takes the rest; it must be last
+        }
+        var end = p
+        while end < plen && path[end] != u8('/') { end += 1 }
+        if end == p { return false } // no more path segments left to match
+        let part = slice(path, p, end)
+        if is_param(seg[0].kind) {
+            if out[0].count < MAX_ROUTE_PARAMS {
+                out[0].names[out[0].count] = seg[0].text.view()
+                out[0].values[out[0].count] = part
+                out[0].count += 1
+            }
+        } else if part != seg[0].text.view() {
+            return false
+        }
+        p = end + 1
+    }
+    return p >= plen // every pattern segment matched, with nothing left over
+}
+
+// One registered route.
+new type Route {
+    method: string
+    segments: List<Seg>
+    handler: RouteHandler
+}
+
+// A router: register routes with get/post/put/delete (or group()), then pass
+// dispatch_handler (below) to serve()/serve_with() with this router as its
+// context.
+pub new class Router {
+    routes: List<Route>
+
+    pub new function init() {}
+
+    pub new mut function get(pattern: str, handler: own RouteHandler) { self.add("GET", pattern, handler) }
+    pub new mut function post(pattern: str, handler: own RouteHandler) { self.add("POST", pattern, handler) }
+    pub new mut function put(pattern: str, handler: own RouteHandler) { self.add("PUT", pattern, handler) }
+    pub new mut function delete(pattern: str, handler: own RouteHandler) { self.add("DELETE", pattern, handler) }
+
+    new mut function add(method: str, pattern: str, handler: own RouteHandler) {
+        self.routes.push(Route(string(method), parse_segments(pattern), handler))
+    }
+
+    // Routes registered through the group share this router's table, with
+    // `prefix` prepended to every pattern.
+    pub new function group(prefix: str) -> RouteGroup {
+        return RouteGroup(ptr<Router>(&self), string(prefix))
+    }
+
+    // The single Handler to give serve()/serve_with() — see dispatch_handler,
+    // which is what you actually pass; this is what it calls.
+    pub new function handle(req: Request, res: Response) {
+        var allowed: [str; 8] = [""]
+        var allowed_count = 0
+        for i in 0..int(self.routes.len()) {
+            let route = self.routes.at(uint(i))
+            var params = no_params()
+            if try_match(ptr<List<Seg>>(&route[0].segments), req.path, ptr<Params>(&params)) {
+                if same_ignoring_case(route[0].method.view(), req.method) {
+                    route[0].handler(req, res, params)
+                    return
+                }
+                if allowed_count < MAX_ALLOWED_METHODS {
+                    allowed[allowed_count] = route[0].method.view()
+                    allowed_count += 1
+                }
+            }
+        }
+        if allowed_count == 0 {
+            res.not_found()
+            return
+        }
+        var list = string("")
+        for i in 0..allowed_count {
+            if i > 0 { list.append(", ") }
+            list.append(allowed[i])
+        }
+        res.header("Allow", list.view())
+        if req.method == "OPTIONS" { res.status(204) } else { res.status(405) }
+    }
+}
+
+pub new class RouteGroup {
+    router: ptr<Router>
+    prefix: string
+
+    pub new mut function get(pattern: str, handler: own RouteHandler) { self.router[0].add("GET", (self.prefix + pattern).view(), handler) }
+    pub new mut function post(pattern: str, handler: own RouteHandler) { self.router[0].add("POST", (self.prefix + pattern).view(), handler) }
+    pub new mut function put(pattern: str, handler: own RouteHandler) { self.router[0].add("PUT", (self.prefix + pattern).view(), handler) }
+    pub new mut function delete(pattern: str, handler: own RouteHandler) { self.router[0].add("DELETE", (self.prefix + pattern).view(), handler) }
+}
+
+// Pass this to serve()/serve_with(), with a Router as the context (e.g.
+// `serve_with(host, port, threads, ptr<u8>(&router), dispatch_handler)`).
+pub new function dispatch_handler(req: Request, res: Response) {
+    ptr<Router>(req.context)[0].handle(req, res)
+}

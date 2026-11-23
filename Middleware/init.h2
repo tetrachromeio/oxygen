@@ -1,0 +1,221 @@
+// Oxygen.Middleware: cross-cutting concerns (CORS, security headers, request
+// IDs, access logging) as plain functions you call from your own handler —
+// not Handler-wrapping decorators. Oxygen's core Handler type can't capture
+// variables (every worker thread calls the same one, with no per-call state
+// of its own — see init.h2's module doc), so there's no "wrap_cors(handler)
+// -> Handler" that could close over a config and an inner handler the way
+// the issue this was built from first sketched it. Calling each piece
+// directly, in order, from a handler you write is the shape that actually
+// fits:
+//
+//     use Oxygen
+//     use Oxygen.Middleware
+//
+//     new function handle(req: Request, res: Response) {
+//         if cors(my_cors, req, res) { return }         // true: preflight, already answered
+//         add_security_headers(my_security, res)
+//         let id = request_id(req)
+//         res.header("X-Request-Id", id.view())
+//         let t0 = now()
+//
+//         if req.get("/") { res.text("Hello, World!") }
+//         else { res.not_found() }
+//
+//         log_access(req, res, id.view(), t0)
+//     }
+//
+use Elemental
+use Elemental.Time
+use Oxygen
+
+// ---------------------------------------------------------------- CORS
+
+pub new type CorsConfig {
+    pub allowed_origin: str      // "*", or one exact origin to echo back
+    pub allowed_methods: str     // e.g. "GET, POST, PUT, DELETE, OPTIONS"
+    pub allowed_headers: str     // e.g. "Content-Type, Authorization"
+    pub allow_credentials: bool
+    pub max_age_seconds: int     // Access-Control-Max-Age; 0 omits it
+}
+
+// A permissive starting point: wildcard origin, the usual methods, no
+// credentials. Narrow it for anything that isn't a fully public API.
+pub new function default_cors() -> CorsConfig {
+    return CorsConfig("*", "GET, POST, PUT, DELETE, OPTIONS", "Content-Type, Authorization", false, 0)
+}
+
+// Adds CORS headers to `res` for `req`. Returns true if this was a preflight
+// `OPTIONS` request that's now fully answered (204) — the caller should
+// return right away, not go on to its real handler. Returns false
+// otherwise, after adding the non-preflight CORS headers; the caller
+// continues as normal.
+//
+// `allow_credentials` with a wildcard `allowed_origin` is invalid per the
+// Fetch spec (browsers reject it) — asking for both here sends no
+// `Access-Control-Allow-Credentials` at all rather than a response no
+// browser would honor anyway.
+pub new function cors(cfg: CorsConfig, req: Request, res: Response) -> bool {
+    res.header("Access-Control-Allow-Origin", cfg.allowed_origin)
+    if cfg.allow_credentials && cfg.allowed_origin != "*" {
+        res.header("Access-Control-Allow-Credentials", "true")
+    }
+    if req.method == "OPTIONS" {
+        res.header("Access-Control-Allow-Methods", cfg.allowed_methods)
+        res.header("Access-Control-Allow-Headers", cfg.allowed_headers)
+        if cfg.max_age_seconds > 0 { res.header("Access-Control-Max-Age", "{cfg.max_age_seconds}") }
+        res.status(204)
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- security headers
+
+pub new type SecurityHeadersConfig {
+    pub x_frame_options: str            // "" omits it; else e.g. "DENY", "SAMEORIGIN"
+    pub referrer_policy: str            // "" omits it
+    pub content_security_policy: str    // "" omits it
+    pub hsts_max_age_seconds: int       // 0 omits Strict-Transport-Security
+}
+
+// X-Content-Type-Options: nosniff always; DENY framing, no-referrer, no CSP,
+// no HSTS. Narrow or widen per app — HSTS in particular should only be
+// turned on once you're sure every path to this server is HTTPS (it tells
+// browsers to refuse HTTP to this host for max_age_seconds, which is not
+// reversible by serving a different header later within that window).
+pub new function default_security_headers() -> SecurityHeadersConfig {
+    return SecurityHeadersConfig("DENY", "no-referrer", "", 0)
+}
+
+pub new function add_security_headers(cfg: SecurityHeadersConfig, res: Response) {
+    res.header("X-Content-Type-Options", "nosniff")
+    if cfg.x_frame_options.len > 0 { res.header("X-Frame-Options", cfg.x_frame_options) }
+    if cfg.referrer_policy.len > 0 { res.header("Referrer-Policy", cfg.referrer_policy) }
+    if cfg.content_security_policy.len > 0 { res.header("Content-Security-Policy", cfg.content_security_policy) }
+    if cfg.hsts_max_age_seconds > 0 { res.header("Strict-Transport-Security", "max-age={cfg.hsts_max_age_seconds}") }
+}
+
+// ---------------------------------------------------------------- request IDs & access logging
+
+// The incoming X-Request-Id if the caller (or a proxy in front of this
+// server) set one, otherwise a freshly generated one. Not cryptographically
+// unique — built from the monotonic and wall clocks, which is enough to
+// correlate one request's own log lines, not a security token. An upstream
+// value is trusted as-is (not reformatted), matching how most systems that
+// propagate this header work: validate it yourself first if you're worried
+// about log injection from an untrusted caller setting it to something odd.
+pub new function request_id(req: Request) -> string {
+    let existing = req.header("X-Request-Id")
+    if existing.len > 0 { return string(existing) }
+    return string("{now()}-{unix_time()}")
+}
+
+// One line per request: method, path, status, the request id, and latency
+// in seconds. Call this once, after your handler has answered (so
+// res.status_code() is the real one) — including after end_events() for a
+// streamed response, since the status only reflects what begin_events()
+// sent (normally 200) until then anyway.
+pub new function log_access(req: Request, res: Response, id: str, started_at: float) {
+    print("{req.method} {req.path} {res.status_code()} id={id} {now() - started_at}s")
+}
+
+// ---------------------------------------------------------------- trusted-proxy header extraction
+
+// The IP part of a "ip:port" / "[ipv6]:port" peer string (req.peer), with the
+// port dropped — what gets compared against `trusted`, since a reverse
+// proxy's trusted identity is its address, not whatever ephemeral port this
+// particular connection happened to use.
+new function peer_ip(peer: str) -> str {
+    if peer.len > 0 && peer[0] == u8('[') {
+        var i: uint = 1
+        while i < peer.len && peer[i] != u8(']') { i += 1 }
+        return slice(peer, 1, i)
+    }
+    var i = peer.len
+    while i > 0 && peer[i - 1] != u8(':') { i -= 1 }
+    if i == 0 { return peer } // no colon: not "ip:port" shaped, so it's as given
+    return slice(peer, 0, i - 1)
+}
+
+new function is_trusted(ip: str, trusted: List<str>) -> bool {
+    for i in 0..int(trusted.len()) { if trusted.at(uint(i))[0] == ip { return true } }
+    return false
+}
+
+// One "for=" value out of one comma-separated segment of a Forwarded header
+// (RFC 7239), quotes stripped if present ("for=\"[::1]\"" -> "[::1]"); "" if
+// this segment has no for= parameter. Case-insensitive on the parameter name,
+// as RFC 7239 requires; doesn't unescape quoted-pair backslash sequences,
+// since an address never legitimately contains one.
+new function forwarded_for(segment: str) -> str {
+    for part_untrimmed in split(segment, ";") {
+        let part = trim(part_untrimmed)
+        if part.len < 4 { continue }
+        if !same_ignoring_case(slice(part, 0, 3), "for") { continue }
+        if part[3] != u8('=') { continue }
+        var v = slice(part, 4, part.len)
+        if v.len >= 2 && v[0] == u8('"') && v[v.len - 1] == u8('"') { v = slice(v, 1, v.len - 1) }
+        return v
+    }
+    return ""
+}
+
+// The chain of client addresses a possibly-multi-hop proxy chain reported,
+// oldest (closest to the original client) first — from the `Forwarded`
+// header if present (its for= values, RFC 7239 §4), else `X-Forwarded-For`
+// (plain comma-separated addresses, the older de facto convention both still
+// in wide use). Entries are returned exactly as the header had them (not
+// validated as real IPs): the caller only ever compares them against an
+// exact-match trusted list or hands the result back out, never parses them
+// as something that must be well-formed.
+new function forwarded_chain(req: Request) -> List<str> {
+    var chain = List<str>()
+    let fwd = req.header("Forwarded")
+    if fwd.len > 0 {
+        for segment in split(fwd, ",") {
+            let v = forwarded_for(segment)
+            if v.len > 0 { chain.push(v) }
+        }
+        return chain
+    }
+    let xff = req.header("X-Forwarded-For")
+    if xff.len > 0 {
+        for part in split(xff, ",") { chain.push(trim(part)) }
+    }
+    return chain
+}
+
+// The real client address for `req`, honoring `Forwarded`/`X-Forwarded-For`
+// only as far as a chain of addresses in `trusted` actually vouches for them.
+//
+// If the immediate TCP peer (`req.peer`, minus its port) isn't itself in
+// `trusted`, the headers are ignored outright and `req.peer` is returned —
+// an untrusted client can set either header to anything, so trusting them
+// without this check is exactly the vulnerability this function exists to
+// prevent.
+//
+// Otherwise, each hop a trusted proxy added is itself untrustworthy until
+// it's checked: walk the chain from the right (the hop closest to this
+// server, and the hardest for the original client to have forged through a
+// correctly configured chain) leftward, skipping entries that are themselves
+// in `trusted` (chained trusted proxies), and return the first one that
+// isn't — the right-most *untrusted* entry. If every entry turns out to be
+// trusted (or the header was missing/empty), there's no untrusted boundary
+// to report: fall back to the left-most entry if there is one (the chain's
+// own claim of the original client), else `req.peer`.
+//
+// v1: exact-IP matching only, no CIDR ranges — if that's a real limitation
+// in practice (a reverse proxy pool whose addresses move around), say so
+// rather than growing this to a range parser preemptively.
+pub new function trusted_proxy_addr(req: Request, trusted: List<str>) -> str {
+    if !is_trusted(peer_ip(req.peer), trusted) { return req.peer }
+    let chain = forwarded_chain(req)
+    var i = int(chain.len()) - 1
+    while i >= 0 {
+        let entry = chain.at(uint(i))[0]
+        if !is_trusted(entry, trusted) { return entry }
+        i -= 1
+    }
+    if chain.len() > 0 { return chain.at(0)[0] }
+    return req.peer
+}

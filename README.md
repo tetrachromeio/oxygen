@@ -22,8 +22,9 @@ new function main() -> int { return serve("127.0.0.1", 8080, 0, handle) }   // 0
 ## Status
 
 Pre-1.0. The API in this README is what's shipped and tested; it can still
-change. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test it,
-and [SECURITY.md](SECURITY.md) to report a vulnerability privately.
+change. See [ROADMAP.md](ROADMAP.md) for what 1.0 means and what's left,
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test it, and
+[SECURITY.md](SECURITY.md) to report a vulnerability privately.
 
 ## Installation
 
@@ -98,7 +99,8 @@ this repo yet.
 
 ## Why it's fast
 
-- **One event loop per core** (epoll on Linux, kqueue on macOS), each with its
+- **One event loop per core** (epoll on Linux, kqueue on macOS; `select()` on
+  Windows — see **Limits**), each with its
   own listening socket that the kernel spreads connections across (Linux).
   Loops share nothing: no locks, no work stealing, no atomics on the request
   path.
@@ -125,6 +127,7 @@ this repo yet.
 | `req.decoded_path()` | the path, percent-decoded |
 | `req.header_count`, `req.header_at(i)` | all headers |
 | `req.match_prefix(prefix)` | if the path is `prefix`, or starts with it at a `/` boundary, the rest of the path (a view: no copy) — `Some(rest)` or `None`; a `prefix` itself ending in `/` matches anything after it, boundary or not |
+| `req.peer` | the TCP peer's address as `"ip:port"` (IPv6 bracketed: `"[::1]:port"`), captured once at `accept()` — not a per-request syscall. Don't trust it as the "real" client address behind a reverse proxy without checking it's that proxy first — see `Oxygen.Middleware`'s `trusted_proxy_addr` |
 
 ### `Response`
 | | |
@@ -134,6 +137,7 @@ this repo yet.
 | `res.not_found()` `res.status(code)` | status with its reason as the body |
 | `res.header(name, value)` | extra header (before sending); ignored if `name`/`value` contain CR or LF, or if the response is already sent |
 | `res.close()` | close the connection after this response |
+| `res.status_code()` | the status this response was sent with, or `0` if it hasn't been yet |
 | `res.begin_events()`, `res.event(data)`, `res.end_events()` | Server-Sent Events, each event sent at once; `event` returns false once the client has gone |
 
 A handler that doesn't answer gets a 500. Requests are answered in order;
@@ -161,8 +165,132 @@ connection that was simply sitting idle at the time (not actively mid-request)
 drains via the same idle timeout below, rather than being cut off early —
 within a bound, not held open indefinitely either.
 
+## Modules
+
+Opt-in layers on top of the core, each its own submodule — `use Oxygen` alone
+never pulls one in, so a service that doesn't need it pays nothing for it.
+
+### `Oxygen.Middleware`
+
+Cross-cutting concerns (CORS, security headers, request IDs, access
+logging) as plain functions you call from your own handler, not
+`Handler`-wrapping decorators — Oxygen's core `Handler` can't capture
+variables, so there's no closure to wrap one in:
+
+```
+use Oxygen
+use Oxygen.Middleware
+
+new function handle(req: Request, res: Response) {
+    if cors(default_cors(), req, res) { return }   // true: preflight, already answered
+    add_security_headers(default_security_headers(), res)
+    let id = request_id(req)
+    res.header("X-Request-Id", id.view())
+    let t0 = now()
+
+    if req.get("/") { res.text("Hello, World!") }
+    else { res.not_found() }
+
+    log_access(req, res, id.view(), t0)
+}
+```
+
+- `cors(config, req, res) -> bool`: adds CORS headers; answers an `OPTIONS`
+  preflight itself (204) and returns `true`, meaning the caller should
+  return right away rather than continue to its real handler.
+  `allow_credentials` with a wildcard `allowed_origin` is invalid per the
+  Fetch spec, so that combination sends no `Access-Control-Allow-Credentials`
+  rather than a response no browser would honor anyway.
+- `add_security_headers(config, res)`: `X-Content-Type-Options: nosniff`
+  always; configurable `X-Frame-Options`, `Referrer-Policy`,
+  `Content-Security-Policy`, `Strict-Transport-Security`.
+- `request_id(req) -> string`: the incoming `X-Request-Id` if there is one,
+  otherwise a freshly generated one (not a security token — just enough to
+  correlate one request's own log lines).
+- `log_access(req, res, id, started_at)`: one line with method, path,
+  status, the request id, and latency — call it after your handler answers,
+  so `res.status_code()` (new on `Response`, for this) is the real one.
+
+**Trusted-proxy header extraction:**
+
+```
+var trusted = List<str>()
+trusted.push("10.0.0.1")   // your reverse proxy's address, exactly
+
+new function handle(req: Request, res: Response) {
+    let client = trusted_proxy_addr(req, trusted)
+    // client is req.peer unless req.peer is itself in `trusted`, in which
+    // case it's the right-most address in Forwarded/X-Forwarded-For that
+    // *isn't* — i.e. the real client, as reported by a proxy you trust.
+}
+```
+
+`trusted_proxy_addr(req, trusted) -> str` only honors `Forwarded`
+(its `for=` values, RFC 7239) or, failing that, `X-Forwarded-For` when the
+immediate TCP peer (`req.peer`, new on `Request`, from `accept()`'s
+`getpeername` — no per-request cost) is itself in `trusted`; an untrusted
+peer's headers are ignored outright, full stop, since an untrusted client
+can set either header to anything. A multi-hop chain resolves to the
+right-most entry that *isn't* itself in `trusted` (chained trusted proxies
+are skipped over), not naively the first or last item. v1 is exact-IP
+matching only, no CIDR ranges.
+
+### `Oxygen.Router`
+
+Dynamic path params (`/users/:id`), a wildcard tail (`/static/*path`),
+`router.group(prefix)` for a prefixed sub-router, automatic `405 Method Not
+Allowed` + `Allow`, and automatic `OPTIONS`:
+
+```
+use Oxygen
+use Oxygen.Router
+
+new function get_user(req: Request, res: Response, p: Params) {
+    match p.get("id") {
+        Some(id) => { res.text("user " + string(id)) }
+        None => { res.status(400) }
+    }
+}
+
+new function main() -> int {
+    var router = Router()
+    router.get("/users/:id", get_user)
+    return serve_with("127.0.0.1", 8080, 1, ptr<u8>(&router), dispatch_handler)
+}
+```
+
+Route handlers take `(Request, Response, Params)`, not plain `(Request,
+Response)` — `Params.get(name)` returns a captured segment as a zero-copy
+view into `req.path`, `Some(value)` or `None`. Register every route before
+calling `serve`/`serve_with`, not after: dispatch only reads the route table,
+but every worker thread reads it without synchronization, the same way
+`context` already works for shared app state — which is exactly what this
+uses (`req.context` is the `Router`, so bring your own app state via a field
+on your own struct that embeds a `Router`, rather than fighting over that one
+pointer).
+
+Routes are matched with a linear scan, not a trie: measured at a 50-route
+table, ~0.3us/dispatch regardless of where the match lands (first route,
+last, or no match at all) — about 5% of the ~5.5us/request budget implied by
+this README's ~180k req/s/core number, in the worst case. Real but not
+dominant at this scale; a trie would matter more for a route table orders of
+magnitude larger, or traffic that's mostly 404s.
+
 ## Limits (for now)
 
+- **Windows: compiles and links, unverified by execution.** The runtime
+  (`h2rt.c`, hydrogen repo) has a Winsock/`select()`-based port — checked to
+  compile and link cleanly against a real `x86_64-w64-mingw32-gcc-posix`
+  cross-toolchain, zero warnings even with `-Wall` — but nobody has run the
+  resulting binary on actual Windows yet. Known gaps even once it is:
+  `select()` is O(n) per wait and capped at 1024 sockets (raised from the
+  default 64, but still nowhere near epoll/kqueue's scaling — a real port
+  would want IOCP, a different async model entirely); there's no
+  `SO_REUSEPORT` equivalent, so `share_port` is a no-op there the same as it
+  already is on anything non-Linux; external process termination (service
+  stop, Task Manager) doesn't deliver a signal Windows' C runtime forwards
+  as `SIGTERM`, so graceful shutdown only works when something in-process
+  calls `raise_sigterm()` itself, not from outside.
 - No TLS: put Oxygen behind a proxy for HTTPS.
 - Bodies up to 16 MB, up to 64 headers; transfer encodings other than chunked
   get 501. Chunk extensions and trailer lines are capped (4 KB / 64 KB) rather

@@ -110,7 +110,7 @@ new function run_loop(w: Worker) -> int {
                     let fd = sock_accept(lfd)
                     if fd < 0 { break }
                     while int(conns.len()) <= fd {
-                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false, 0, 0))
+                        conns.push(Conn(false, Buffer(null, 0, 0), Buffer(null, 0, 0), 0, false, false, 0, 0, string("")))
                     }
                     let c = conns.at(uint(fd))
                     if c[0].input.data == null {
@@ -119,6 +119,15 @@ new function run_loop(w: Worker) -> int {
                     }
                     c[0].open = true
                     c[0].last_active = t
+                    // Captured once here, not per request: a connection's peer
+                    // can't change mid-connection, and this slot (indexed by fd)
+                    // gets reused by later, unrelated connections once this one
+                    // closes, so it must be refreshed on every accept, not just
+                    // the first time this slot is used.
+                    match sock_peer_addr(fd) {
+                        Some(addr) => { c[0].peer = addr }
+                        None => { c[0].peer = string("") }
+                    }
                     poller.watch(fd, fd, true, false)
                 }
                 continue

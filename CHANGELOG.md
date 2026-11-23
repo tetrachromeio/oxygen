@@ -35,6 +35,102 @@ Extended/Ecosystem tracking issue [#2](https://github.com/tetrachromeio/oxygen/i
 - 2000 iterations: `dispatch()` 0.00234s vs. a real socket round-trip
   0.12351s — about **53x** faster, the actual point of an in-process
   harness rather than something to assume.
+## 2026-11-20 — connection peer address, trusted-proxy header extraction
+
+From [#10](https://github.com/tetrachromeio/oxygen/issues/10) and
+[#11](https://github.com/tetrachromeio/oxygen/issues/11), part of the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Added
+
+- **`req.peer`** on `Request`: the TCP peer's `"ip:port"` (IPv6 bracketed),
+  captured once at `accept()` time via a new `getpeername`-based runtime
+  primitive (`h2_sock_peer_addr` in the hydrogen repo, wrapped as
+  `Elemental.Net.sock_peer_addr`) — no per-request syscall, and re-captured
+  on every `accept()` since a connection slot (indexed by fd) gets reused by
+  later, unrelated connections once one closes.
+- **`Oxygen.Middleware.trusted_proxy_addr(req, trusted)`**: the real client
+  address, honoring `Forwarded`/`X-Forwarded-For` only when `req.peer` is
+  itself in `trusted` — an untrusted peer's headers are ignored outright,
+  the one case that actually matters here. A multi-hop chain resolves to
+  the right-most entry that *isn't* in `trusted` (chained trusted proxies
+  skipped over), not naively the first or last item. v1 is exact-IP
+  matching only, no CIDR ranges — not found to be a real limitation while
+  building this, but flagging it rather than growing this preemptively.
+
+### Tested
+
+- `examples/middleware`: a trusted peer with no forwarded header (returns
+  `req.peer`), a trusted peer with one forwarded hop, a trusted peer with a
+  two-hop chain where the nearer hop is itself a trusted proxy (resolves to
+  the far hop, not the near one), an untrusted peer's forged
+  `X-Forwarded-For` being ignored, and `Forwarded`'s `for=` being read
+  alongside `X-Forwarded-For`.
+- IPv6 peer formatting (`"[::1]:port"`) is implemented per the standard
+  `getpeername`/`inet_ntop` pattern but unverified in this environment: the
+  cloud sandbox this was built in has no IPv6 support at all (confirmed:
+  `socket(AF_INET6, ...)` itself fails with `EAFNOSUPPORT`). IPv4 verified
+  against a real client's own observed source port.
+
+## 2026-11-19 — `Oxygen.Middleware`
+
+From [#4](https://github.com/tetrachromeio/oxygen/issues/4), part of the
+## 2026-11-19 — `Oxygen.Router`
+
+From [#3](https://github.com/tetrachromeio/oxygen/issues/3), part of the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Added
+
+- **`Oxygen.Middleware`**, a new opt-in submodule: `cors()`,
+  `add_security_headers()`, `request_id()`, `log_access()` — plain
+  functions called directly from your own handler, not `Handler`-wrapping
+  decorators (settled design question from the issue: Oxygen's core
+  `Handler` can't capture variables, so a literal
+  `wrap_cors(handler) -> Handler` isn't possible the way the issue first
+  sketched it).
+- **`Response.status_code()`**, a small core addition this needed: the
+  status a response was sent with, or `0` before it has been. Set once, in
+  `head()` — the single place every send path (`send`, `status`,
+  `begin_events`) already goes through.
+
+### Deferred
+
+- Trusted-proxy header extraction (`Forwarded`/`X-Forwarded-For`). Doing it
+  safely means only honoring those headers when the immediate TCP peer is
+  itself a trusted proxy, and the core doesn't expose a connection's peer
+  address to a handler at all yet. Shipping it without that would mean
+  trusting every client's `Forwarded` header unconditionally — exactly the
+  vulnerability this is supposed to prevent — so it's deferred rather than
+  shipped half-safe. Split out to
+  [#11](https://github.com/tetrachromeio/oxygen/issues/11), blocked on
+  [#10](https://github.com/tetrachromeio/oxygen/issues/10) (exposing a
+  connection's peer address on `Request` — a real core gap found while
+  building this, not originally in scope).
+- **`Oxygen.Router`**, a new opt-in submodule: dynamic path params
+  (`/users/:id`), a wildcard tail (`/static/*path`), `router.group(prefix)`
+  for a prefixed sub-router, automatic `405 Method Not Allowed` with an
+  `Allow` header, and automatic `OPTIONS`. Route handlers take
+  `(Request, Response, Params)`; `Params.get(name)` returns a captured
+  segment as a zero-copy view into `req.path`.
+- Dispatches through the existing `context` mechanism
+  (`dispatch_handler` + a `Router` as context), the same way any other
+  shared app state reaches a handler.
+
+### Measured
+
+- Linear scan vs. a trie: a 50-route table (mixed literal/dynamic segments)
+  takes ~0.3us per dispatch, regardless of whether the match is the first
+  route, the last, or no match at all after scanning everything. Against the
+  ~5.5us/request budget implied by the ~180k req/s/core number above, that's
+  about 5% of it in the worst case — real, but not dominant at this scale.
+  Kept the linear scan; a trie would matter more for a route table orders of
+  magnitude larger, or traffic that's mostly 404s.
+- No heap allocation on a successful dispatch (checked by inspection — the
+  only allocation in `handle()` is on the 405/`Allow`-building path, not the
+  match-and-call path) and no RSS growth over 10,000 real requests against a
+  running server (2516KB -> 2524KB; the few KB of noise is connection/OS
+  churn, not a per-request leak).
 
 ## 2026-11-19 — idle/header timeouts, graceful shutdown, `match_prefix`
 
