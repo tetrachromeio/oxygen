@@ -4,6 +4,43 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Oxygen is pre-1.0, so there's no versioned release yet — entries are dated
 instead.
 
+## 2026-11-20 — connection peer address, trusted-proxy header extraction
+
+From [#10](https://github.com/tetrachromeio/oxygen/issues/10) and
+[#11](https://github.com/tetrachromeio/oxygen/issues/11), part of the
+[extended-modules tracking issue](https://github.com/tetrachromeio/oxygen/issues/2).
+
+### Added
+
+- **`req.peer`** on `Request`: the TCP peer's `"ip:port"` (IPv6 bracketed),
+  captured once at `accept()` time via a new `getpeername`-based runtime
+  primitive (`h2_sock_peer_addr` in the hydrogen repo, wrapped as
+  `Elemental.Net.sock_peer_addr`) — no per-request syscall, and re-captured
+  on every `accept()` since a connection slot (indexed by fd) gets reused by
+  later, unrelated connections once one closes.
+- **`Oxygen.Middleware.trusted_proxy_addr(req, trusted)`**: the real client
+  address, honoring `Forwarded`/`X-Forwarded-For` only when `req.peer` is
+  itself in `trusted` — an untrusted peer's headers are ignored outright,
+  the one case that actually matters here. A multi-hop chain resolves to
+  the right-most entry that *isn't* in `trusted` (chained trusted proxies
+  skipped over), not naively the first or last item. v1 is exact-IP
+  matching only, no CIDR ranges — not found to be a real limitation while
+  building this, but flagging it rather than growing this preemptively.
+
+### Tested
+
+- `examples/middleware`: a trusted peer with no forwarded header (returns
+  `req.peer`), a trusted peer with one forwarded hop, a trusted peer with a
+  two-hop chain where the nearer hop is itself a trusted proxy (resolves to
+  the far hop, not the near one), an untrusted peer's forged
+  `X-Forwarded-For` being ignored, and `Forwarded`'s `for=` being read
+  alongside `X-Forwarded-For`.
+- IPv6 peer formatting (`"[::1]:port"`) is implemented per the standard
+  `getpeername`/`inet_ntop` pattern but unverified in this environment: the
+  cloud sandbox this was built in has no IPv6 support at all (confirmed:
+  `socket(AF_INET6, ...)` itself fails with `EAFNOSUPPORT`). IPv4 verified
+  against a real client's own observed source port.
+
 ## 2026-11-19 — `Oxygen.Middleware`
 
 From [#4](https://github.com/tetrachromeio/oxygen/issues/4), part of the

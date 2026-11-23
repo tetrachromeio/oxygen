@@ -24,15 +24,6 @@
 //         log_access(req, res, id.view(), t0)
 //     }
 //
-// Trusted-proxy header extraction (Forwarded / X-Forwarded-For) isn't here:
-// doing it safely means only honoring those headers when the immediate TCP
-// peer is itself a trusted proxy, and Oxygen's core doesn't expose a
-// connection's peer address to a handler at all yet. Implementing it without
-// that would mean either trusting every client's Forwarded header
-// unconditionally (exactly the vulnerability this is supposed to prevent) or
-// faking the check, so it's deferred until the core exposes peer addresses
-// (tetrachromeio/oxygen#10) rather than shipped half-safe — see
-// tetrachromeio/oxygen#11 for that piece.
 use Elemental
 use Elemental.Time
 use Oxygen
@@ -126,4 +117,105 @@ pub new function request_id(req: Request) -> string {
 // sent (normally 200) until then anyway.
 pub new function log_access(req: Request, res: Response, id: str, started_at: float) {
     print("{req.method} {req.path} {res.status_code()} id={id} {now() - started_at}s")
+}
+
+// ---------------------------------------------------------------- trusted-proxy header extraction
+
+// The IP part of a "ip:port" / "[ipv6]:port" peer string (req.peer), with the
+// port dropped — what gets compared against `trusted`, since a reverse
+// proxy's trusted identity is its address, not whatever ephemeral port this
+// particular connection happened to use.
+new function peer_ip(peer: str) -> str {
+    if peer.len > 0 && peer[0] == u8('[') {
+        var i: uint = 1
+        while i < peer.len && peer[i] != u8(']') { i += 1 }
+        return slice(peer, 1, i)
+    }
+    var i = peer.len
+    while i > 0 && peer[i - 1] != u8(':') { i -= 1 }
+    if i == 0 { return peer } // no colon: not "ip:port" shaped, so it's as given
+    return slice(peer, 0, i - 1)
+}
+
+new function is_trusted(ip: str, trusted: List<str>) -> bool {
+    for i in 0..int(trusted.len()) { if trusted.at(uint(i))[0] == ip { return true } }
+    return false
+}
+
+// One "for=" value out of one comma-separated segment of a Forwarded header
+// (RFC 7239), quotes stripped if present ("for=\"[::1]\"" -> "[::1]"); "" if
+// this segment has no for= parameter. Case-insensitive on the parameter name,
+// as RFC 7239 requires; doesn't unescape quoted-pair backslash sequences,
+// since an address never legitimately contains one.
+new function forwarded_for(segment: str) -> str {
+    for part_untrimmed in split(segment, ";") {
+        let part = trim(part_untrimmed)
+        if part.len < 4 { continue }
+        if !same_ignoring_case(slice(part, 0, 3), "for") { continue }
+        if part[3] != u8('=') { continue }
+        var v = slice(part, 4, part.len)
+        if v.len >= 2 && v[0] == u8('"') && v[v.len - 1] == u8('"') { v = slice(v, 1, v.len - 1) }
+        return v
+    }
+    return ""
+}
+
+// The chain of client addresses a possibly-multi-hop proxy chain reported,
+// oldest (closest to the original client) first — from the `Forwarded`
+// header if present (its for= values, RFC 7239 §4), else `X-Forwarded-For`
+// (plain comma-separated addresses, the older de facto convention both still
+// in wide use). Entries are returned exactly as the header had them (not
+// validated as real IPs): the caller only ever compares them against an
+// exact-match trusted list or hands the result back out, never parses them
+// as something that must be well-formed.
+new function forwarded_chain(req: Request) -> List<str> {
+    var chain = List<str>()
+    let fwd = req.header("Forwarded")
+    if fwd.len > 0 {
+        for segment in split(fwd, ",") {
+            let v = forwarded_for(segment)
+            if v.len > 0 { chain.push(v) }
+        }
+        return chain
+    }
+    let xff = req.header("X-Forwarded-For")
+    if xff.len > 0 {
+        for part in split(xff, ",") { chain.push(trim(part)) }
+    }
+    return chain
+}
+
+// The real client address for `req`, honoring `Forwarded`/`X-Forwarded-For`
+// only as far as a chain of addresses in `trusted` actually vouches for them.
+//
+// If the immediate TCP peer (`req.peer`, minus its port) isn't itself in
+// `trusted`, the headers are ignored outright and `req.peer` is returned —
+// an untrusted client can set either header to anything, so trusting them
+// without this check is exactly the vulnerability this function exists to
+// prevent.
+//
+// Otherwise, each hop a trusted proxy added is itself untrustworthy until
+// it's checked: walk the chain from the right (the hop closest to this
+// server, and the hardest for the original client to have forged through a
+// correctly configured chain) leftward, skipping entries that are themselves
+// in `trusted` (chained trusted proxies), and return the first one that
+// isn't — the right-most *untrusted* entry. If every entry turns out to be
+// trusted (or the header was missing/empty), there's no untrusted boundary
+// to report: fall back to the left-most entry if there is one (the chain's
+// own claim of the original client), else `req.peer`.
+//
+// v1: exact-IP matching only, no CIDR ranges — if that's a real limitation
+// in practice (a reverse proxy pool whose addresses move around), say so
+// rather than growing this to a range parser preemptively.
+pub new function trusted_proxy_addr(req: Request, trusted: List<str>) -> str {
+    if !is_trusted(peer_ip(req.peer), trusted) { return req.peer }
+    let chain = forwarded_chain(req)
+    var i = int(chain.len()) - 1
+    while i >= 0 {
+        let entry = chain.at(uint(i))[0]
+        if !is_trusted(entry, trusted) { return entry }
+        i -= 1
+    }
+    if chain.len() > 0 { return chain.at(0)[0] }
+    return req.peer
 }

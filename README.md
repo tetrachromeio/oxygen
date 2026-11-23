@@ -127,6 +127,7 @@ this repo yet.
 | `req.decoded_path()` | the path, percent-decoded |
 | `req.header_count`, `req.header_at(i)` | all headers |
 | `req.match_prefix(prefix)` | if the path is `prefix`, or starts with it at a `/` boundary, the rest of the path (a view: no copy) — `Some(rest)` or `None`; a `prefix` itself ending in `/` matches anything after it, boundary or not |
+| `req.peer` | the TCP peer's address as `"ip:port"` (IPv6 bracketed: `"[::1]:port"`), captured once at `accept()` — not a per-request syscall. Don't trust it as the "real" client address behind a reverse proxy without checking it's that proxy first — see `Oxygen.Middleware`'s `trusted_proxy_addr` |
 
 ### `Response`
 | | |
@@ -210,15 +211,30 @@ new function handle(req: Request, res: Response) {
   status, the request id, and latency — call it after your handler answers,
   so `res.status_code()` (new on `Response`, for this) is the real one.
 
-**Not here yet:** trusted-proxy header extraction (`Forwarded`/
-`X-Forwarded-For`), since doing it safely means only honoring those headers
-when the immediate TCP peer is itself a trusted proxy, and the core doesn't
-expose a connection's peer address to a handler yet. Shipping it without
-that would mean trusting every client's `Forwarded` header unconditionally —
-exactly the vulnerability this feature exists to prevent — so it's deferred
-until peer addresses are exposed
-([#10](https://github.com/tetrachromeio/oxygen/issues/10)), tracked as
-[#11](https://github.com/tetrachromeio/oxygen/issues/11).
+**Trusted-proxy header extraction:**
+
+```
+var trusted = List<str>()
+trusted.push("10.0.0.1")   // your reverse proxy's address, exactly
+
+new function handle(req: Request, res: Response) {
+    let client = trusted_proxy_addr(req, trusted)
+    // client is req.peer unless req.peer is itself in `trusted`, in which
+    // case it's the right-most address in Forwarded/X-Forwarded-For that
+    // *isn't* — i.e. the real client, as reported by a proxy you trust.
+}
+```
+
+`trusted_proxy_addr(req, trusted) -> str` only honors `Forwarded`
+(its `for=` values, RFC 7239) or, failing that, `X-Forwarded-For` when the
+immediate TCP peer (`req.peer`, new on `Request`, from `accept()`'s
+`getpeername` — no per-request cost) is itself in `trusted`; an untrusted
+peer's headers are ignored outright, full stop, since an untrusted client
+can set either header to anything. A multi-hop chain resolves to the
+right-most entry that *isn't* itself in `trusted` (chained trusted proxies
+are skipped over), not naively the first or last item. v1 is exact-IP
+matching only, no CIDR ranges.
+
 ### `Oxygen.Router`
 
 Dynamic path params (`/users/:id`), a wildcard tail (`/static/*path`),
